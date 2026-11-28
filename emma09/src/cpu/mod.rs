@@ -39,7 +39,7 @@ use emma6k_core::bus::{Bus, BusOp, CpuRequest};
 use emma6k_core::error::{BusError, CpuBuildError, ExecError};
 use emma6k_core::exec::{self, ClockSpeed};
 use emma6k_core::trace::TraceState;
-use emma6k_core::watch::{Operand, WatchContext};
+use emma6k_core::watch::{Operand, WatchContext, WatchError, WatchEvaluator};
 use emma6k_core::{HaltState, MachineState, Processor};
 use emma6k_core::{LogCategory, LogLevel, LogSender, log_msg};
 use opcodes::{DecodedOp, Page};
@@ -264,6 +264,21 @@ impl Cpu {
     pub fn set_trace_callback(&mut self, callback: Option<Box<dyn TraceCallback<Registers>>>) {
         self.tracing = callback.is_some();
         self.trace_callback = callback;
+    }
+
+    /// Evaluates every watchpoint in `evaluator` against the current state,
+    /// returning one result per watchpoint, without short-circuiting. Memory
+    /// is read with `peek`, big-endian, as the CPU's own watch check reads it.
+    /// For a debugger's display, separate from the evaluator `step` consults.
+    pub fn evaluate_watchpoints(
+        &self,
+        evaluator: &mut WatchEvaluator,
+    ) -> Vec<Result<Operand, WatchError>> {
+        let ctx = CpuWatchContext {
+            regs: &self.regs,
+            bus: self.machine.bus(),
+        };
+        evaluator.evaluate_each(&ctx)
     }
 
     /// Flushes the trace callback, if one is installed, making every record

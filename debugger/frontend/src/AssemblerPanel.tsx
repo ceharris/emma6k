@@ -8,6 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { DockviewPanelApi } from "dockview-react";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { useCpuDescription } from "./CpuDescriptionContext";
 import { useEditMenuOverride } from "./EditMenuContext";
 import { useExecutionContext } from "./ExecutionContext";
 import { registerAssemblerPanel } from "./layout/assemblerMenuActions";
@@ -285,15 +286,20 @@ export default function AssemblerPanel({ dockPanelApi }: AssemblerPanelProps = {
   // enforced client-side. New/Open…/Save/Save As… aren't CPU-gated, so only
   // this one item needs syncing (mirrors `set_memory_menu_enabled`'s call
   // site in `MemoryPanel.tsx`).
+  //
+  // Assemble… is also disabled for a CPU the description says has no assembler (the
+  // 6809, so far); the editor and its file commands keep working.
+  const description = useCpuDescription();
+  const hasAssembler = description?.assembler ?? true;
   const lastAssemblerMenuEnabledRef = useRef<boolean | null>(null);
   useEffect(() => {
-    const enabled = execState === "stopped";
+    const enabled = execState === "stopped" && hasAssembler;
     if (enabled === lastAssemblerMenuEnabledRef.current) return;
     lastAssemblerMenuEnabledRef.current = enabled;
     invoke("set_assembler_menu_enabled", { enabled }).catch((e) =>
       console.error("set_assembler_menu_enabled failed:", e),
     );
-  }, [execState]);
+  }, [execState, hasAssembler]);
 
   /**
    * Replaces the whole buffer, resetting dirty/path/report state and
@@ -629,6 +635,12 @@ export default function AssemblerPanel({ dockPanelApi }: AssemblerPanelProps = {
 
   return (
     <div className="assembler-panel">
+      {!hasAssembler && (
+        <div className="assembler-unavailable" role="status">
+          There is no {description?.family} assembler yet: you can edit, open and save source here,
+          but not assemble it.
+        </div>
+      )}
       <div ref={containerRef} className="assembler-container" />
       {report &&
         (report.success ? (

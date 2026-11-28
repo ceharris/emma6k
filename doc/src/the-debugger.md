@@ -2,7 +2,7 @@
 
 `emma6k-debugger` is a native desktop application (built with
 [Tauri](https://tauri.app)) that turns the emulator into a full interactive
-development environment for 65C02 programs. Its main window is a freely
+development environment for 65C02 and 6809 programs. Its main window is a freely
 rearrangeable dock of panels — disassembly, memory, registers, stack,
 breakpoints, watchpoints, symbols, a live execution trace, a log, a built-in
 terminal, an assembler, and one panel per graphical display device — plus an
@@ -17,7 +17,15 @@ self-contained emulator configuration (the same TOML format described under
 [Running the Emulator](running-the-emulator.md)) plus its own watchpoints.
 The default profile lives at `~/.emma/debugger/profiles/default/`, with its
 emulator configuration in `emulator.toml` and its watchpoints in
-`watchpoints.emw`. The dock layout and other UI preferences — theme,
+`watchpoints.emw`.
+
+A profile's `cpu-variant` (or its synonym `cpu`) chooses the CPU the
+debugger runs, as it does for the command line: `65c02` or `wdc65c02` for
+the 6502, or `6809`. A profile that names no CPU is a 6502 profile. The
+panels follow the profile's CPU: its registers and flags, its stack, its
+interrupt lines in the status bar, and the byte order Memory Variables use.
+
+The dock layout and other UI preferences — theme,
 terminal settings, exit-confirmation — aren't tied to any particular
 profile, so switching profiles never rearranges the window.
 
@@ -26,9 +34,10 @@ profile tears down and rebuilds the active session — all four are available
 only while the CPU is stopped:
 
 - **New Profile** (`Ctrl+N`) opens a dialog for a new profile's name and a
-  starter template to seed it from, then switches to it immediately. The
-  bundled templates cover a range of starting points, from a bare interpreter
-  to a graphical demo:
+  starter template to seed it from, then switches to it immediately. Each
+  template is tagged with the CPU it runs. The bundled templates cover a
+  range of starting points, from a bare interpreter to a graphical demo. For
+  the 6502:
   - **TaliForth2** (the default) — Forth-2012 on the emulator's standard
     full device set: 32 KB RAM, 32 KB ROM, a VIA, two ACIAs, an LFSR, and
     the console
@@ -43,6 +52,11 @@ only while the CPU is stopped:
     with a VIA
   - **Snake** — the classic game, played over the console (input and
     output), with a VIA for timing and the LFSR for pseudo-randomness
+
+  For the 6809:
+  - **CamelForth** — CamelForth on 56 KB RAM, 8 KB ROM, the console, and
+    the exit device; Ctrl+C interrupts a running word, and `BYE` stops the
+    CPU
 - **Open Profile** (`Ctrl+O`) shows a native folder picker (defaulting to the
   profiles directory) and switches to whatever profile directory is chosen,
   filling in any files it's missing (an `emulator.toml`, say, but no
@@ -83,13 +97,16 @@ arrangement.
 
 ### Registers
 
-Shows the CPU's registers as two groups — data (A, X, Y) and address/status
-(PC, S, P plus flags) — each with its own radix button that cycles the
-display base (hex, unsigned/signed decimal, octal, and, for the 8-bit data
-group, binary). The A register's value also shows its printable ASCII
-character alongside the number when applicable. The status register's flags
-are shown as individual letters (N V - B D I Z C); a flag that changed on
-the most recent step is highlighted.
+Shows the CPU's registers as two groups — data (the 6502's A, X, Y; the
+6809's A, B, D, DP, X, Y) and address/status (the 6502's PC, S, P; the
+6809's U, S, PC, CC; plus flags) — each with its own radix button that
+cycles the display base (hex, unsigned/signed decimal, octal, and, for the
+data group, binary). An 8-bit data register's value also shows its
+printable ASCII character alongside the number when applicable. The status
+register's flags are shown as individual letters (N V - B D I Z C on the
+6502, E F H I N Z V C on the 6809); a flag that changed on the most recent
+step is highlighted. On the 6809, D is A and B together: editing D changes
+both.
 
 While the CPU is stopped, double-clicking a register value opens an inline
 edit field pre-filled with the current value — type a bare number in the
@@ -152,9 +169,13 @@ in-panel edit, are available only while the CPU is stopped.
 
 ### Stack
 
-Shows eight rows of the current stack page as word pairs, with a marker on
-the most recently pushed byte and the stack pointer's own slot rendered as a
-placeholder rather than a stale value. A radix button cycles the display
+Shows eight rows of the stack as pairs of bytes, in address order, starting
+with the most recently pushed byte and running toward higher addresses. For
+the 6502 that's its stack page (page 1), wrapping around within the page;
+for the 6809, the memory around S, the hardware stack (U, the user stack, is
+in the Registers panel). A marker shows the most recently pushed byte, and a
+byte that isn't on the stack (on the 6502, the free slot S points to) shows
+as a placeholder rather than a stale value. A radix button cycles the display
 base; an EVEN/ODD toggle shifts how bytes are paired into words, a display
 convenience with no effect on the underlying data. It always tracks the
 active stack position — there's no manual scrolling.
@@ -270,7 +291,9 @@ length before anything is actually written to memory — a successful compile
 alone never touches memory. A failed assemble shows errors both as gutter
 markers with hover text and as a plain-text list below the editor. Assemble…
 is available only while the CPU is stopped; the file operations are always
-available.
+available. There's no 6809 assembler yet: with a 6809 profile the panel
+says so, and Assemble… stays disabled, but the editor and its file
+operations still work.
 
 ## Status Bar
 
@@ -279,9 +302,12 @@ it's visible no matter what's docked, floated, or hidden — showing, left to
 right: a running cycle count; the emulator's current effective clock speed;
 an NMI indicator that also triggers a one-shot NMI on click; an IRQ
 indicator that asserts or releases IRQ as a toggle while the CPU is stopped,
-or fires a one-shot pulse while it's running; a Run/Stop indicator that also
-distinguishes a CPU halted on a `STP` or `WAI` instruction from an ordinary
-stop; and a Reset button. This is the only place Reset lives in the UI —
+or fires a one-shot pulse while it's running; for a 6809 profile, a FIRQ
+indicator that works the same way as IRQ's; a Run/Stop indicator that also
+distinguishes a halted CPU from an ordinary stop (on the 6502, a `STP` or
+`WAI` instruction; on the 6809, "Waiting" after `CWAI` or `SYNC`); and a
+Reset button. An indicator lights while any source asserts its line, a
+device as well as the control. This is the only place Reset lives in the UI —
 there's no equivalent button on the Run Controls panel.
 
 ## Menus and Keyboard Shortcuts
@@ -330,13 +356,15 @@ before each instruction; each line of `watchpoints.emw` is one watchpoint,
 and the Watchpoint panel shows whether it's currently triggered. The
 expression language covers:
 
-- **Registers** — `A`, `X`, `Y`, `P`, `S`, `PC`
+- **Registers** — on the 6502, `A`, `X`, `Y`, `P`, `S`, `PC`; on the 6809,
+  `A`, `B`, `D`, `DP`, `X`, `Y`, `U`, `S`, `PC`, `CC`
   ```
   X > 10
   PC == $8010
   ```
-- **CPU status flags**, prefixed with a backtick — `` `N ``, `` `V ``,
-  `` `B ``, `` `D ``, `` `I ``, `` `Z ``, `` `C ``
+- **CPU status flags**, prefixed with a backtick — on the 6502, `` `N ``,
+  `` `V ``, `` `B ``, `` `D ``, `` `I ``, `` `Z ``, `` `C ``; on the 6809,
+  `` `E ``, `` `F ``, `` `H ``, `` `I ``, `` `N ``, `` `Z ``, `` `V ``, `` `C ``
   ```
   `C
   `N && `Z
@@ -348,8 +376,9 @@ expression language covers:
   A == $2A
   ```
 - **Memory operands** — `B[addr]`, `W[addr]`, `D[addr]` read a byte, word, or
-  doubleword from memory; a leading `+` or `-` interprets the value as signed
-  (`-` also negates it)
+  doubleword from memory, in the CPU's byte order (least significant byte
+  first on the 6502, most significant first on the 6809); a leading `+` or
+  `-` interprets the value as signed (`-` also negates it)
   ```
   B[$0200] == $FF
   +B[$D010] < 0    // true when bit 7 (the sign bit) of the byte at $D010 is set

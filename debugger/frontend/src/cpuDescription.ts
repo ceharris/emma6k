@@ -63,3 +63,18 @@ export function toBytes(value: number, sizeBytes: number, order: ByteOrder): num
   }
   return order === "big" ? bytes.reverse() : bytes;
 }
+
+/** The width, in characters, of an instruction's bytes shown as space-separated hex pairs:
+ *  8 for the 6502's three-byte instructions, 14 for the 6809's five. */
+export function instructionBytesWidth(maxInstructionLen: number): number {
+  return Math.max(maxInstructionLen, 1) * 3 - 1;
+}
+
+/** Formats an instruction's bytes as space-separated hex pairs, padded to the width of
+ *  the CPU's longest instruction, so the columns after them line up. */
+export function formatInstructionBytes(bytes: string[], maxInstructionLen: number): string {
+  return bytes
+    .map((b) => b.padStart(2, "0"))
+    .join(" ")
+    .padEnd(instructionBytesWidth(maxInstructionLen), " ");
+}

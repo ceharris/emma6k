@@ -72,7 +72,9 @@ binaries keep the `emma65` name.
 - **`cli`** (package `emma6k`) — the emulator command line: the `emma6k` binary, which chooses the
   CPU from `cpu-variant` (or its synonym `cpu`) and runs it, and the `emma65` and `emma09`
   wrappers, which exec `emma6k` with a hidden `--family` flag fixing the CPU family; and
-  `emma6k-tracer`, which decodes either CPU's trace files (it replaced `emma65-tracer`). Versioned
+  `emma6k-tracer`, which decodes either CPU's trace files (it replaced `emma65-tracer`); plus a
+  small library (crate `emma6k`: `family::Family` and `variant::variant_in`) that the binaries and
+  the debugger share, so both map variants to families and list templates the same way. Versioned
   in lockstep with `emma65`
 - **`core`** (crate `emma6k-core`) — the CPU-neutral emulator core every CPU family shares: bus,
   devices, transports, configuration framework, execution control behind the `Processor` trait,
@@ -177,11 +179,13 @@ core/src/                   — crate emma6k-core, the CPU-neutral core
   location.rs, text.rs      — source-text helpers shared by watch and CPU assemblers; text.rs also
                                has immediate_comment, the disassemblers' 8-bit operand comment
 cli/                        — package emma6k, the emulator command line
+  src/lib.rs, family.rs, variant.rs — the shared library: Family (6502, 6809): variant → family,
+                               wrapper names, merged templates; variant_in (one source's
+                               cpu/cpu-variant), env_source (EMMA6K_*)
   src/bin/emma6k/main.rs    — main, run_6502/run_6809, and run_session<P: Processor> (the console,
                                logging, tracing and run loop, compiled once per CPU)
   src/bin/emma6k/config.rs  — CliArgs, AppConfig (CPU-neutral keys), per-source cpu/cpu-variant
                                checks, LoadedConfig::resolve → RunPlan (family, variant, template)
-  src/bin/emma6k/family.rs  — Family (6502, 6809): variant → family, wrapper names, templates
   src/bin/emma6k/tty.rs     — terminal raw-mode helpers for the CLI console
   src/bin/emma65.rs, src/bin/emma09.rs, src/wrapper.rs — the wrappers (exec emma6k --family …)
   src/bin/emma6k-tracer/    — emma6k-tracer: main.rs reads the header's family and dispatches to
@@ -252,12 +256,12 @@ placeholders) into `dest`, returning the path to the written `emulator.toml`.
 zero-filled RAM at `0x0000`, the TaliForth ROM at `0x8000`, a VIA on a Unix-socket transport, an
 R6551 ACIA on `~/.emma/dev/ttyS0` and an MC6850 ACIA on `~/.emma/dev/ttyS1` (both PTYs), an LFSR,
 and a console with `Ctrl+C` as its break key — WDC65C02 at 1.8432 MHz. `emma6k` merges every
-family's template list (`cli/src/bin/emma6k/family.rs`); a template's `cpu-variant` chooses its
+family's template list (`cli/src/family.rs`); a template's `cpu-variant` chooses its
 family. It materializes a family's default template into a tempdir when no devices are configured,
 or any named template via `--profile <id>` (`LoadedConfig::resolve` and `apply_template` in
 `cli/src/bin/emma6k/config.rs`, loaded through the normal `Toml::file()` path); the 6809's default
 is `camelforth`. The debugger materializes the default into `~/.emma/debugger/profiles/default/` the first
-time that profile directory is created, and offers the full template list in its New Profile
+time that profile directory is created, and offers every family's templates in its New Profile
 dialog (see `profile::ensure_profile_dir`/`list_templates` below).
 
 ---

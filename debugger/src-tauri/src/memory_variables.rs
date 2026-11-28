@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::CpuState;
-use crate::cpu::{ByteOrder, CpuDescriptionState};
+use crate::cpu::{ByteOrder, CpuDescriptionState, DebugCpu};
 use crate::disassembly::LiveSnapshotRx;
 use crate::profile::ProfileDirState;
 use crate::symbols::format_source;
@@ -124,7 +124,7 @@ fn cache_resolved_addrs(rows: &[MemoryVariableRow], cache: &Mutex<HashMap<String
 /// even if the panel was never opened before Run was pressed.
 pub fn refresh_addr_cache_for_run(
     defs: &[VariableDef],
-    cpu: &emma65::emulator::Cpu,
+    cpu: &DebugCpu,
     cache: &Mutex<HashMap<String, Option<u16>>>,
 ) -> Vec<u16> {
     let table = cpu.bus().symbol_table();
@@ -257,11 +257,7 @@ fn resolve_row(
 }
 
 /// Builds a fresh row list for every definition in `defs`, resolved against `cpu`.
-fn resolve_rows(
-    defs: &[VariableDef],
-    cpu: &emma65::emulator::Cpu,
-    order: ByteOrder,
-) -> Vec<MemoryVariableRow> {
+fn resolve_rows(defs: &[VariableDef], cpu: &DebugCpu, order: ByteOrder) -> Vec<MemoryVariableRow> {
     let table = cpu.bus().symbol_table();
     defs.iter()
         .map(|def| resolve_row(def, table, cpu.bus(), order))
@@ -442,13 +438,7 @@ fn resolve_rows_current(
         return rows;
     }
     drop(cpu_guard);
-    let live = live_snapshot_rx
-        .0
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|rx| rx.borrow().clone());
-    match live {
+    match live_snapshot_rx.latest() {
         Some(snapshot) => {
             let cache = resolved_addr_cache.0.lock().unwrap();
             let bytes: HashMap<u16, u8> = snapshot.watched_values.into_iter().collect();
@@ -922,7 +912,7 @@ mod tests {
             .ram_with_fill(AddressRange::new(0x0000, 0xFFFF), 0)
             .unwrap()
             .build();
-        let mut cpu = Cpu::builder(CpuVariant::Wdc65C02).bus(bus).build().unwrap();
+        let mut cpu = DebugCpu::from(Cpu::builder(CpuVariant::Wdc65C02).bus(bus).build().unwrap());
         cpu.bus_mut().symbol_table_mut().insert_tagged(
             "counter".to_string(),
             0x0200,

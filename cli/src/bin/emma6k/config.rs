@@ -10,18 +10,16 @@
 //! `emma65`/`emma09` wrapper's hidden `--family` flag, and bare `emma6k`
 //! stops with an error: it has no default CPU.
 
-use crate::family::{Family, find_template};
 use clap::Parser;
+use emma6k::family::{Family, find_template};
+use emma6k::variant::{env_source, variant_in};
 use emma6k_core::config::template::Template;
 use emma6k_core::config::{DeviceSpec, ExpandedPathBuf, UnmappedPolicySpec};
 use figment::{
     Figment,
-    providers::{Env, Format, Serialized, Toml},
+    providers::{Format, Serialized, Toml},
 };
-use serde::{Deserialize, Deserializer, Serialize};
-
-/// The prefix of environment variables that set configuration keys.
-const ENV_PREFIX: &str = "EMMA6K_";
+use serde::{Deserialize, Serialize};
 
 /// The error when nothing chooses a CPU.
 pub const NO_CPU: &str = "no CPU selected: set cpu-variant (or cpu) in the configuration, \
@@ -71,7 +69,7 @@ pub struct AppConfig {
     #[clap(long = "cpu-variant", visible_alias = "cpu")]
     #[serde(
         default,
-        deserialize_with = "variant_value",
+        deserialize_with = "emma6k::variant::variant_value",
         skip_serializing_if = "Option::is_none"
     )]
     pub cpu_variant: Option<String>,
@@ -81,7 +79,7 @@ pub struct AppConfig {
     #[clap(skip)]
     #[serde(
         default,
-        deserialize_with = "variant_value",
+        deserialize_with = "emma6k::variant::variant_value",
         skip_serializing_if = "Option::is_none"
     )]
     pub cpu: Option<String>,
@@ -156,51 +154,6 @@ pub struct RunPlan {
     /// the machine is built.
     #[allow(dead_code, reason = "held so the template's files outlive the build")]
     pub template_dir: Option<tempfile::TempDir>,
-}
-
-/// The `cpu` and `cpu-variant` keys of one source.
-#[derive(Default, Deserialize)]
-struct CpuKeys {
-    #[serde(default, deserialize_with = "variant_value")]
-    cpu: Option<String>,
-    #[serde(rename = "cpu-variant", default, deserialize_with = "variant_value")]
-    cpu_variant: Option<String>,
-}
-
-/// Reads a CPU variant as text. Accepts a number too, since `6809` in an
-/// environment variable or unquoted in TOML arrives as one.
-fn variant_value<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Variant {
-        Text(String),
-        Number(u64),
-    }
-    Ok(
-        Option::<Variant>::deserialize(deserializer)?.map(|v| match v {
-            Variant::Text(s) => s,
-            Variant::Number(n) => n.to_string(),
-        }),
-    )
-}
-
-/// Returns the CPU variant one source sets, or an error if it sets both
-/// spellings.
-fn variant_in(source: Figment, name: &str) -> Result<Option<String>, String> {
-    let keys: CpuKeys = source.extract().map_err(|e| format!("{name}: {e}"))?;
-    match keys {
-        CpuKeys {
-            cpu: Some(_),
-            cpu_variant: Some(_),
-        } => Err(format!(
-            "{name} sets both cpu and cpu-variant; set only one"
-        )),
-        CpuKeys { cpu, cpu_variant } => Ok(cpu.or(cpu_variant)),
-    }
-}
-
-fn env_source() -> Env {
-    Env::prefixed(ENV_PREFIX).map(|k| k.as_str().replace('_', "-").into())
 }
 
 impl AppConfig {
@@ -341,7 +294,7 @@ fn apply_template(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::family::FAMILIES;
+    use emma6k::family::FAMILIES;
 
     fn loaded(args: &[&str]) -> Result<LoadedConfig, String> {
         let cli = CliArgs::try_parse_from(std::iter::once("emma6k").chain(args.iter().copied()))

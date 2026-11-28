@@ -5,6 +5,15 @@
   overflow: hidden;
 }
 
+// Shown above the editor for a CPU with no assembler yet.
+.assembler-unavailable {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-muted);
+  font-size: var(--font-size-btn);
+}
+
 .assembler-summary {
   flex: 0 0 auto;
   padding: 4px 10px;

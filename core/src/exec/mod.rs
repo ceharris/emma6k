@@ -61,6 +61,8 @@ pub struct CpuLiveSnapshot<R> {
     pub elapsed: Duration,
     /// True if any device is currently asserting IRQ.
     pub irq_active: bool,
+    /// True if any source routed to FIRQ is currently asserting it.
+    pub firq_active: bool,
     /// True if an NMI is pending (latched but not yet serviced).
     pub nmi_pending: bool,
     /// True when the CPU executed STP and is halted until reset.
@@ -115,6 +117,7 @@ fn build_live_snapshot<P: Processor>(
         cycles_delta: cpu.cycles() - start_cycles,
         elapsed: start_timestamp.elapsed(),
         irq_active: cpu.interrupts().irq_active(),
+        firq_active: cpu.interrupts().firq_active(),
         nmi_pending: cpu.interrupts().nmi_pending(),
         cpu_stopped: cpu.is_stopped(),
         exit_status: cpu.machine().exit_status(),

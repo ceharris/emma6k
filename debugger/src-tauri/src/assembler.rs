@@ -6,13 +6,29 @@
 //! assemble's result across the Tauri IPC boundary is deliberate — `assemble`
 //! is a pure, deterministic function of the source text, so a second call is
 //! cheap and avoids needing `AssembledProgram` to be `Serialize`.
+//!
+//! Only the 6502 has an assembler so far. For a CPU whose description says it has
+//! none, both commands refuse, and the panel disables itself.
 
 use tauri::{AppHandle, Emitter, State};
 
 use emma65::assembler;
-use emma65::emulator::{Cpu, SymbolSource};
+use emma65::emulator::SymbolSource;
 
 use crate::CpuState;
+use crate::cpu::{CpuDescriptionState, DebugCpu};
+
+/// Returns an error unless the loaded session's CPU has an assembler. Before a session
+/// loads, assembling stays allowed, as it always has been for a preview.
+fn require_assembler(description_state: &CpuDescriptionState) -> Result<(), String> {
+    match description_state.0.lock().unwrap().as_ref() {
+        Some(description) if !description.assembler => Err(format!(
+            "The Assembler panel has no {} assembler yet",
+            description.family
+        )),
+        _ => Ok(()),
+    }
+}
 
 #[derive(Clone, serde::Serialize)]
 pub struct AssembleDiagnostic {
@@ -84,7 +100,7 @@ fn assemble_preview_report(source: &str) -> AssembleReport {
 ///
 /// On failure, makes zero bus writes, even when a later segment in a
 /// multi-`.org` source would have succeeded.
-fn assemble_and_patch(source: &str, cpu: &mut Cpu) -> AssembleReport {
+fn assemble_and_patch(source: &str, cpu: &mut DebugCpu) -> AssembleReport {
     let program = match assembler::assemble(source) {
         Ok(program) => program,
         Err(errors) => {
@@ -129,8 +145,12 @@ fn assemble_and_patch(source: &str, cpu: &mut Cpu) -> AssembleReport {
 /// Doesn't touch the CPU at all (assembling is pure), so unlike
 /// `assemble_and_load` it isn't gated on the CPU being halted.
 #[tauri::command]
-pub fn assemble_preview(source: String) -> AssembleReport {
-    assemble_preview_report(&source)
+pub fn assemble_preview(
+    source: String,
+    description_state: State<CpuDescriptionState>,
+) -> Result<AssembleReport, String> {
+    require_assembler(&description_state)?;
+    Ok(assemble_preview_report(&source))
 }
 
 /// Assembles `source` and patches the result into the CPU's bus, replacing
@@ -142,7 +162,7 @@ pub fn assemble_preview(source: String) -> AssembleReport {
 /// Only callable while the CPU is halted; returns an error if the CPU is
 /// running. A bad assembly source is *not* an `Err` here — it's reported as
 /// `AssembleReport { success: false, .. }`; `Err` is reserved for
-/// infrastructure failure (CPU not ready). Emits `"debugger-halted"`,
+/// infrastructure failure (CPU not ready, or a CPU with no assembler). Emits `"debugger-halted"`,
 /// `"memory-modified"`, and `"symbols-changed"` on return regardless of
 /// `success`, to refresh dependent panels (a no-op refresh on failure is
 /// harmless).
@@ -156,13 +176,15 @@ pub fn assemble_preview(source: String) -> AssembleReport {
 pub fn assemble_and_load(
     source: String,
     cpu_state: State<CpuState>,
+    description_state: State<CpuDescriptionState>,
     app: AppHandle,
 ) -> Result<AssembleReport, String> {
+    require_assembler(&description_state)?;
     let (report, pc) = {
         let mut guard = cpu_state.0.lock().unwrap();
         let cpu = guard.as_mut().ok_or("CPU not ready")?;
         let report = assemble_and_patch(&source, cpu);
-        (report, cpu.registers().pc)
+        (report, cpu.pc())
     };
     app.emit("debugger-halted", pc).ok();
     app.emit("memory-modified", ()).ok();
@@ -193,7 +215,7 @@ mod tests {
     use super::*;
     use emma65::emulator::{AddressRange, Bus, ClockSpeed, CpuBuilder, CpuVariant};
 
-    fn make_cpu() -> Cpu {
+    fn make_cpu() -> DebugCpu {
         let bus = Bus::config()
             .ram_with_fill(AddressRange::new(0x0000, 0xFFFF), 0)
             .unwrap()
@@ -204,7 +226,18 @@ mod tests {
             .build()
             .unwrap();
         cpu.reset().unwrap();
-        cpu
+        cpu.into()
+    }
+
+    #[test]
+    fn a_cpu_with_no_assembler_refuses_to_assemble() {
+        let state = CpuDescriptionState(std::sync::Mutex::new(None));
+        assert!(require_assembler(&state).is_ok());
+        *state.0.lock().unwrap() = Some(crate::cpu::describe_6502(CpuVariant::Wdc65C02));
+        assert!(require_assembler(&state).is_ok());
+        *state.0.lock().unwrap() = Some(crate::cpu::describe_6809());
+        let err = require_assembler(&state).unwrap_err();
+        assert!(err.contains("no 6809 assembler"), "{err}");
     }
 
     #[test]

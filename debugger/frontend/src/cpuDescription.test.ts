@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { toBytes } from "./cpuDescription";
+import { formatInstructionBytes, instructionBytesWidth, toBytes } from "./cpuDescription";
 
 describe("toBytes", () => {
   it("writes least significant byte first for a little-endian CPU", () => {
@@ -19,5 +19,18 @@ describe("toBytes", () => {
 
   it("splits a dword above 2^31 without sign trouble", () => {
     expect(toBytes(0xfedcba98, 4, "big")).toEqual([0xfe, 0xdc, 0xba, 0x98]);
+  });
+});
+
+describe("formatInstructionBytes", () => {
+  it("pads to the 6502's three-byte instructions", () => {
+    expect(instructionBytesWidth(3)).toBe(8);
+    expect(formatInstructionBytes(["A9", "01"], 3)).toBe("A9 01   ");
+  });
+
+  it("pads to the 6809's five-byte instructions", () => {
+    expect(instructionBytesWidth(5)).toBe(14);
+    expect(formatInstructionBytes(["10", "8E", "12", "34"], 5)).toBe("10 8E 12 34   ");
+    expect(formatInstructionBytes([], 5)).toBe(" ".repeat(14));
   });
 });

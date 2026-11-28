@@ -73,10 +73,11 @@ impl FromStr for CpuVariantSpec {
         match us {
             "65C02" | "C02" => Ok(Cmos6502),
             "WDC65C02" | "WDC02" => Ok(Wdc6502),
-            // A 6809 variant, which the emma6k binary runs but the debugger
-            // (this Config's other user) doesn't yet.
+            // A 6809 variant: the emma6k binary and the debugger choose the
+            // family before they extract this Config, so only a caller that
+            // skips that step gets here.
             "6809" | "6309" => Err(format!(
-                "CPU variant '{s}' isn't a 6502: the debugger supports only the 6502 (65c02, wdc65c02)"
+                "CPU variant '{s}' isn't a 6502 (expected 65c02 or wdc65c02)"
             )),
             _ => Err(format!("Invalid CPU variant '{s}'")),
         }
@@ -353,7 +354,7 @@ mod tests {
     #[test]
     fn a_6809_variant_is_rejected_as_not_a_6502() {
         let err = "6809".parse::<CpuVariantSpec>().unwrap_err();
-        assert!(err.contains("the debugger supports only the 6502"), "{err}");
+        assert!(err.contains("isn't a 6502"), "{err}");
     }
 
     #[test]

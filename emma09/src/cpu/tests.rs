@@ -630,6 +630,27 @@ fn watch_context_reads_registers_and_memory_big_endian() {
     assert_eq!(ctx.read_flag(0x04), 0);
 }
 
+#[test]
+fn evaluate_watchpoints_reports_each_without_short_circuiting() {
+    use emma6k_core::watch::WatchCompiler;
+    let mut cpu = cpu(&[]);
+    write(&mut cpu, 0x2000, &[0x12, 0x34]);
+    cpu.regs.set_d(0x0102);
+    cpu.regs.cc = ConditionCodes::Z;
+    let mut compiler = WatchCompiler::new(map_register_name, map_flag_name, |_| None);
+    let mut evaluator = WatchEvaluator::new();
+    for source in ["W[$2000] == $1234", "D == $0102", "`Z", "`C", "B[$2000]"] {
+        let wp = compiler.compile(source, &mut evaluator).unwrap();
+        evaluator.add(wp);
+    }
+    let results: Vec<_> = cpu
+        .evaluate_watchpoints(&mut evaluator)
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(results, [1, 1, 1, 0, 0x12]);
+}
+
 // --- hardware interrupts ---
 
 mod interrupts {
