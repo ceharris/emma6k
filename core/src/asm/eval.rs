@@ -9,7 +9,7 @@ use super::expr::{BinaryOperatorType, Expr, ExprType, Operand, UnaryOperatorType
 /// not yet present in `symbols` — during the assembler's multi-pass
 /// resolution this means "not yet resolvable," not an error. Only once no
 /// further passes will add symbols does an unresolved reference become a
-/// real error, which is decided by the driver (a later unit), not here.
+/// real error, which is decided by the driver, not here.
 /// Errors returned here are limited to expressions that are otherwise fully
 /// resolvable this pass (e.g. division by zero).
 pub fn evaluate(expr: &Expr, symbols: &HashMap<String, Operand>) -> Result<Option<Operand>, Error> {

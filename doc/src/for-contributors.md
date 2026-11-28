@@ -70,7 +70,9 @@ The two crates are versioned and released together.
 A second CPU, the Motorola 6809, is being added in its own crate, `emma09`,
 built on `emma6k-core` alone. Its instruction set, interrupts and
 configuration are in place, and it passes W. Schwotzer's MC6809 CPU test
-suite; a way to run it from the command line is still to come.
+suite. It runs from the command line (`emma09`, or `emma6k` with
+`cpu-variant = "6809"`) and in the debugger, though the debugger's Assembler
+panel doesn't support it yet.
 
 ## Bus
 
@@ -169,7 +171,12 @@ and `emma65::disassembler` are re-exports of `mos6502::assembler` and
   multi-pass resolution handles forward references and picks the zero-page
   addressing mode once an operand's value is known. Output segments are
   ready to load into emulator memory (e.g. via `Bus::patch`) or round-trip
-  through the disassembler for verification.
+  through the disassembler for verification. Everything but the instruction
+  set is shared with other CPUs in `emma6k-core`'s `asm` module: the scanner,
+  expressions, the statement grammar with the `.org`/`.byte`/`.word`/`.res`
+  directives, and the multi-pass driver. The 6502 plugs in as an
+  `asm::Target`, which parses its mnemonics and operands, handles `.setcpu`,
+  encodes each instruction, and stores `.word` low byte first.
 - **`disassembler`** — decodes bus memory into human-readable instruction
   listings via side-effect-free `peek` reads, sharing the same opcode decode
   table and variant logic as the CPU (see [CPU](#cpu) above); its `trace`

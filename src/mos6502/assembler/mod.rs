@@ -3,46 +3,29 @@
 //! `assemble(source)` turns 6502 assembly source text into one or more
 //! output segments (each an origin plus a byte vector) and a symbol table,
 //! ready to be written into emulator memory (e.g. via `Bus::patch`) or
-//! disassembled back for verification. See `plan/assembler-plan.md` for the
-//! full design.
+//! disassembled back for verification. The scanner, expressions, statement
+//! grammar and multi-pass driver are shared with other CPUs in
+//! `emma6k_core::asm`; this module is the 6502's [`Target`] for them: its
+//! mnemonics, operand syntax, `.setcpu`, and encoding. See
+//! `plan/assembler-plan.md` for the full design.
+//!
+//! [`Target`]: emma6k_core::asm::Target
 
-mod driver;
-mod error;
-mod eval;
-mod expr;
 mod instructions;
 mod operand;
-mod parser;
-mod scanner;
-mod statement;
-mod token;
+mod target;
 
-use emma6k_core::bus::{SymbolSource, SymbolTable};
+#[cfg(test)]
+mod driver_tests;
+#[cfg(test)]
+mod statement_tests;
 
-pub use driver::Segment;
-pub use error::Error;
-
-/// The result of successfully assembling a source program: one or more
-/// `.org`-delimited output segments, in source order, plus the final symbol
-/// table (labels and `=`/`.equ` assignments).
-#[derive(Debug, Clone)]
-pub struct AssembledProgram {
-    pub segments: Vec<Segment>,
-    pub symbols: SymbolTable,
-}
+pub use emma6k_core::asm::{AssembledProgram, Error, Segment};
 
 /// Assembles `source`, returning the resulting segments and symbol table, or
 /// every error found (not just the first) if assembly fails.
 pub fn assemble(source: &str) -> Result<AssembledProgram, Vec<Error>> {
-    let output = driver::assemble(source)?;
-    let mut symbols = SymbolTable::new();
-    for (name, address) in output.symbols {
-        symbols.insert_tagged(name, address as u16, SymbolSource::Assembler);
-    }
-    Ok(AssembledProgram {
-        segments: output.segments,
-        symbols,
-    })
+    emma6k_core::asm::assemble(&target::Mos6502::new(), source)
 }
 
 #[cfg(test)]
@@ -53,6 +36,7 @@ mod tests {
     use crate::mos6502::cpu::opcodes::{AddressingMode, DecodedOp, Mnemonic, decode_table};
     use crate::mos6502::cpu::variant::CpuVariant;
     use crate::mos6502::disassembler::Disassembler;
+    use emma6k_core::bus::SymbolTable;
     use emma6k_core::{AddressRange, Bus, RomWritePolicy};
 
     fn assemble_ok(source: &str) -> AssembledProgram {

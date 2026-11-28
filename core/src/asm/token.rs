@@ -1,4 +1,4 @@
-use emma6k_core::location::Location;
+use crate::location::Location;
 use std::mem;
 
 #[derive(Debug, Clone, PartialEq)]

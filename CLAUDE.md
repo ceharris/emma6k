@@ -107,8 +107,8 @@ binaries keep the `emma65` name.
   renders it in-process instead); spawned by the emulator as a child process over a `pipe:`
   transport, per `plan/lcd-display-external-protocol.md`
 
-`emma6k-core`'s modules sit at its crate root: `emma6k_core::{bus, config, device, error, exec,
-session, transport, watch, location, text}`, plus root re-exports (`Bus`, `Processor`,
+`emma6k-core`'s modules sit at its crate root: `emma6k_core::{asm, bus, config, device, error,
+exec, session, transport, watch, location, text}`, plus root re-exports (`Bus`, `Processor`,
 `MachineState`, `log_channel`, the `log_msg!` macro, …).
 
 The `emma65` library exposes three top-level public modules:
@@ -146,7 +146,9 @@ src/                        — crate emma65
     templates/              — the bundled starter-profile templates (see below)
     disassembler/           — Disassembler, and disassembler/trace (reconstructs disassembly
                                lines from a recorded trace stream)
-    assembler/              — 65C02 assembler
+    assembler/              — 65C02 assembler: the 6502's asm::Target (target.rs: mnemonics,
+                               operand syntax, .setcpu, encoding), instructions.rs, operand.rs;
+                               statement_tests.rs/driver_tests.rs drive core's asm through it
     exec_tests.rs, device_tests.rs — 6502-driven tests of core exec and devices
 core/src/                   — crate emma6k-core, the CPU-neutral core
   lib.rs                    — module declarations and the root re-export surface
@@ -176,8 +178,13 @@ core/src/                   — crate emma6k-core, the CPU-neutral core
                                TraceCallback, BinaryTraceWriter/Reader, spawn_trace_writer,
                                TraceState — all generic over the CPU's Registers
   watch/                    — watchpoint expression pipeline (see below)
-  location.rs, text.rs      — source-text helpers shared by watch and CPU assemblers; text.rs also
-                               has immediate_comment, the disassemblers' 8-bit operand comment
+  asm/                      — the CPU-neutral assembler: scanner, tokens, expr/eval, parser, the
+                               statement grammar (.org/.byte/.word/.res, labels, =/.equ), and the
+                               multi-pass driver, generic over a CPU's `Target` trait (parse an
+                               instruction or CPU directive, encode, `.word` byte order);
+                               tests.rs drives it with a toy target
+  location.rs, text.rs      — source-text helpers shared by watch and asm; text.rs also has
+                               immediate_comment, the disassemblers' 8-bit operand comment
 cli/                        — package emma6k, the emulator command line
   src/lib.rs, family.rs, variant.rs — the shared library: Family (6502, 6809): variant → family,
                                wrapper names, merged templates; variant_in (one source's

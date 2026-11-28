@@ -1,6 +1,7 @@
 //! Multi-pass assembly driver: lays out statements across one or more
-//! `.org`-delimited segments, resolves forward references, shrinks
-//! zero-page-eligible operands, and reports final errors (undefined
+//! `.org`-delimited segments, resolves forward references, lets the
+//! [`Target`] shrink operands whose values turn out to fit a shorter
+//! encoding (the 6502's zero page), and reports final errors (undefined
 //! symbols, segment overlaps, duplicate labels, non-convergence).
 //!
 //! See the "Multi-pass resolution and zero-page optimization" and
@@ -9,13 +10,11 @@
 
 use std::collections::HashMap;
 
+use super::Target;
 use super::error::Error;
 use super::eval::evaluate;
-use super::instructions::InstructionTable;
-use super::operand::encode;
-use super::statement::{ByteOperand, Directive, Statement, parse_program};
-use crate::mos6502::cpu::variant::CpuVariant;
-use emma6k_core::location::Location;
+use super::statement::{ByteOperand, Directive, Statement, TargetStatement, parse_program};
+use crate::location::Location;
 
 /// A finite cap on the number of layout passes, guarding against a genuine
 /// non-convergence (see the plan doc) rather than looping forever. Ordinary
@@ -39,61 +38,37 @@ impl Segment {
     }
 }
 
-/// The `InstructionTable` for each supported [`CpuVariant`], built once and
-/// selected per instruction according to whichever variant is active at
-/// that point in the source (see [`Directive::SetCpu`]).
-struct VariantTables {
-    cmos: InstructionTable,
-    wdc: InstructionTable,
-}
-
-impl VariantTables {
-    fn new() -> Self {
-        Self {
-            cmos: InstructionTable::new(CpuVariant::Cmos65C02),
-            wdc: InstructionTable::new(CpuVariant::Wdc65C02),
-        }
-    }
-
-    fn get(&self, variant: CpuVariant) -> &InstructionTable {
-        match variant {
-            CpuVariant::Cmos65C02 => &self.cmos,
-            CpuVariant::Wdc65C02 => &self.wdc,
-        }
-    }
-}
-
 /// The driver's result: assembled segments in `.org` order, plus the final
-/// symbol table (label and `=`/`.equ` values). A later unit adapts this into
-/// the public `assemble()` API's `AssembledProgram`.
+/// symbol table (label and `=`/`.equ` values). [`super::assemble`] adapts
+/// this into an [`super::AssembledProgram`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssembledOutput {
     pub segments: Vec<Segment>,
     pub symbols: HashMap<String, u32>,
 }
 
-/// Assembles `source`, collecting all errors found rather than stopping at
-/// the first one. The CPU variant defaults to [`CpuVariant::Cmos65C02`] and
-/// is selected (and may be changed any number of times) from within the
-/// source itself via the `.setcpu` directive — see [`Directive::SetCpu`].
-pub fn assemble(source: &str) -> Result<AssembledOutput, Vec<Error>> {
-    assemble_with_pass_limit(source, DEFAULT_MAX_PASSES)
+/// Assembles `source` for `target`, collecting all errors found rather than
+/// stopping at the first one.
+pub fn assemble<T: Target>(target: &T, source: &str) -> Result<AssembledOutput, Vec<Error>> {
+    assemble_with_pass_limit(target, source, DEFAULT_MAX_PASSES)
 }
 
-fn assemble_with_pass_limit(
+/// [`assemble`] with at most `max_passes` layout passes before giving up
+/// with a non-convergence error; a low limit lets a test provoke that error.
+pub fn assemble_with_pass_limit<T: Target>(
+    target: &T,
     source: &str,
     max_passes: usize,
 ) -> Result<AssembledOutput, Vec<Error>> {
-    let statements = parse_program(source).map_err(|e| vec![e])?;
+    let statements = parse_program(target, source).map_err(|e| vec![e])?;
     check_duplicate_symbols(&statements)?;
 
-    let tables = VariantTables::new();
     let mut symbols: HashMap<String, u32> = HashMap::new();
     let mut sizes: Vec<u8> = vec![0; statements.len()];
     let mut converged = false;
     for _ in 0..max_passes {
         let previous_sizes = sizes.clone();
-        run_pass(&statements, &mut symbols, &mut sizes, &tables, false)?;
+        run_pass(target, &statements, &mut symbols, &mut sizes, false)?;
         if sizes == previous_sizes {
             converged = true;
             break;
@@ -107,7 +82,7 @@ fn assemble_with_pass_limit(
         )]);
     }
 
-    let segments = run_pass(&statements, &mut symbols, &mut sizes, &tables, true)?;
+    let segments = run_pass(target, &statements, &mut symbols, &mut sizes, true)?;
     check_overlaps(&segments)?;
 
     Ok(AssembledOutput { segments, symbols })
@@ -116,7 +91,9 @@ fn assemble_with_pass_limit(
 /// Detects two symbol-defining statements (a `Label` or `SymbolAssign`)
 /// using the same name. This is a purely syntactic check, independent of
 /// address resolution, so it runs once up front rather than per pass.
-fn check_duplicate_symbols(statements: &[(Statement, Location)]) -> Result<(), Vec<Error>> {
+fn check_duplicate_symbols<I, D>(
+    statements: &[(Statement<'_, I, D>, Location)],
+) -> Result<(), Vec<Error>> {
     let mut seen: HashMap<&str, Location> = HashMap::new();
     let mut errors = Vec::new();
     for (statement, location) in statements {
@@ -179,20 +156,21 @@ fn check_overlaps(segments: &[Segment]) -> Result<(), Vec<Error>> {
 /// `Error`. Structural errors (a byte-emitting statement before any `.org`,
 /// an `.org`/`.res` address that depends on a forward reference) are always
 /// real errors, since more passes can never fix them.
-fn run_pass<'a>(
-    statements: &[(Statement<'a>, Location)],
+fn run_pass<'a, T: Target>(
+    target: &T,
+    statements: &[(TargetStatement<'a, T>, Location)],
     symbols: &mut HashMap<String, u32>,
     sizes: &mut [u8],
-    tables: &VariantTables,
     final_pass: bool,
 ) -> Result<Vec<Segment>, Vec<Error>> {
     let mut segments: Vec<Segment> = Vec::new();
     let mut current: Option<usize> = None;
     let mut errors: Vec<Error> = Vec::new();
-    // Resets to the default at the start of every pass, then gets updated in
-    // source order as `.setcpu` directives are (re-)encountered — matching
-    // how `current`/`segments` are also rebuilt fresh each pass.
-    let mut variant = CpuVariant::Cmos65C02;
+    // Resets to the target's initial state at the start of every pass, then
+    // gets updated in source order as the target's directives (the 6502's
+    // `.setcpu`) are (re-)encountered — matching how `current`/`segments`
+    // are also rebuilt fresh each pass.
+    let mut state = target.initial_state();
 
     for (i, (statement, location)) in statements.iter().enumerate() {
         let location = *location;
@@ -204,7 +182,11 @@ fn run_pass<'a>(
                 }
                 None => errors.push(no_active_segment_error(location, "label")),
             },
-            Statement::Directive(Directive::SetCpu(new_variant)) => variant = *new_variant,
+            Statement::Directive(Directive::Target(directive)) => {
+                if let Err(e) = target.apply_directive(directive, &mut state, symbols, location) {
+                    errors.push(e);
+                }
+            }
             Statement::SymbolAssign(name, expr) => match evaluate(expr, symbols) {
                 Ok(Some(value)) => {
                     symbols.insert(name.clone(), value);
@@ -265,9 +247,9 @@ fn run_pass<'a>(
                 Some(seg) => {
                     for expr in exprs {
                         match evaluate(expr, symbols) {
-                            Ok(Some(value)) => {
-                                segments[seg].bytes.extend((value as u16).to_le_bytes())
-                            }
+                            Ok(Some(value)) => segments[seg]
+                                .bytes
+                                .extend(T::WORD_ORDER.word_bytes(value as u16)),
                             Ok(None) => {
                                 if final_pass {
                                     errors.push(undefined_symbol_error(location));
@@ -294,12 +276,11 @@ fn run_pass<'a>(
                     Err(e) => errors.push(e),
                 },
             },
-            Statement::Instruction(mnemonic, operand) => match current {
+            Statement::Instruction(instruction) => match current {
                 None => errors.push(no_active_segment_error(location, "instruction")),
                 Some(seg) => {
                     let addr = segments[seg].next_address();
-                    let table = tables.get(variant);
-                    match encode(*mnemonic, operand, addr, symbols, table, location) {
+                    match target.encode(instruction, addr, symbols, &state, location) {
                         Ok(encoded) => {
                             sizes[i] = encoded.byte_len;
                             match encoded.bytes {
@@ -338,207 +319,4 @@ fn no_active_segment_error(location: Location, what: &str) -> Error {
         location.column,
         &format!("{what} used before any '.org' directive"),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn assemble_ok(source: &str) -> AssembledOutput {
-        assemble(source).unwrap_or_else(|errors| {
-            panic!("expected assembly to succeed, got errors: {errors:?}");
-        })
-    }
-
-    fn assemble_err(source: &str) -> Vec<Error> {
-        assemble(source).expect_err("expected assembly to fail")
-    }
-
-    #[test]
-    fn assemble_simple_program() {
-        let output = assemble_ok(".org $8000\nLDA #$01\nSTA $10\n");
-        assert_eq!(output.segments.len(), 1);
-        assert_eq!(output.segments[0].origin, 0x8000);
-        assert_eq!(output.segments[0].bytes, vec![0xA9, 0x01, 0x85, 0x10]);
-    }
-
-    #[test]
-    fn assemble_backward_label_reference() {
-        let output = assemble_ok(".org $8000\nloop:\nLDA #1\nBNE loop\n");
-        // BNE at 0x8002, 2-byte instruction -> pc_after 0x8004, target 0x8000 -> displacement -4
-        assert_eq!(output.segments[0].bytes, vec![0xA9, 0x01, 0xD0, 0xFC]);
-        assert_eq!(output.symbols.get("loop"), Some(&0x8000));
-    }
-
-    #[test]
-    fn assemble_forward_reference_shrinks_to_zero_page() {
-        // "forward" isn't known until after LDA references it; the driver
-        // must discover across passes that it resolves to a zero-page value
-        // and shrink the instruction from Absolute down to ZeroPage.
-        let output = assemble_ok(".org $0200\nLDA forward\nforward = $10\n");
-        assert_eq!(output.segments[0].bytes, vec![0xA5, 0x10]);
-    }
-
-    #[test]
-    fn assemble_forward_label_reference_in_word_directive() {
-        let output = assemble_ok(".org $8000\n.word target\nNOP\ntarget:\nNOP\n");
-        // target = $8000 (segment origin) + 2 (.word) + 1 (first NOP) = $8003
-        assert_eq!(&output.segments[0].bytes[0..2], &[0x03, 0x80]);
-        assert_eq!(output.symbols.get("target"), Some(&0x8003));
-    }
-
-    #[test]
-    fn assemble_byte_directive_with_mixed_operands() {
-        let output = assemble_ok(".org $8000\n.byte 1, \"AB\", 2\n");
-        assert_eq!(output.segments[0].bytes, vec![1, b'A', b'B', 2]);
-    }
-
-    #[test]
-    fn assemble_word_directive() {
-        let output = assemble_ok(".org $8000\n.word $1234, $5678\n");
-        assert_eq!(output.segments[0].bytes, vec![0x34, 0x12, 0x78, 0x56]);
-    }
-
-    #[test]
-    fn assemble_res_directive_reserves_zero_bytes_and_advances_address() {
-        let output = assemble_ok(".org $8000\n.res 4\nhere:\nNOP\n");
-        assert_eq!(output.segments[0].bytes, vec![0, 0, 0, 0, 0xEA]);
-        assert_eq!(output.symbols.get("here"), Some(&0x8004));
-    }
-
-    #[test]
-    fn assemble_multiple_non_overlapping_segments() {
-        let output = assemble_ok(".org $8000\nLDA #1\n.org $9000\nLDA #2\n");
-        assert_eq!(output.segments.len(), 2);
-        assert_eq!(
-            output.segments[0],
-            Segment {
-                origin: 0x8000,
-                bytes: vec![0xA9, 0x01]
-            }
-        );
-        assert_eq!(
-            output.segments[1],
-            Segment {
-                origin: 0x9000,
-                bytes: vec![0xA9, 0x02]
-            }
-        );
-    }
-
-    #[test]
-    fn assemble_overlapping_segments_error() {
-        let errors = assemble_err(".org $8000\n.byte 1,2,3,4,5\n.org $8003\nLDA #1\n");
-        assert!(errors.iter().any(|e| e.message().contains("overlaps")));
-    }
-
-    #[test]
-    fn assemble_duplicate_org_address_error() {
-        let errors = assemble_err(".org $8000\n.org $8000\n");
-        assert!(errors.iter().any(|e| e.message().contains("overlaps")));
-    }
-
-    #[test]
-    fn assemble_byte_before_org_error() {
-        let errors = assemble_err(".byte 1\n");
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.message().contains("before any '.org'"))
-        );
-    }
-
-    #[test]
-    fn assemble_duplicate_label_error() {
-        let errors = assemble_err(".org $8000\nfoo:\nfoo:\n");
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.message().contains("already defined"))
-        );
-    }
-
-    #[test]
-    fn assemble_undefined_symbol_error() {
-        let errors = assemble_err(".org $8000\nLDA missing\n");
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.message().contains("undefined symbol"))
-        );
-    }
-
-    #[test]
-    fn assemble_res_forward_reference_error() {
-        let errors = assemble_err(".org $8000\n.res forward\nforward = 4\n");
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.message().contains("forward reference"))
-        );
-    }
-
-    #[test]
-    fn assemble_org_forward_reference_error() {
-        let errors = assemble_err(".org forward\nforward = $8000\n");
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.message().contains("forward reference"))
-        );
-    }
-
-    #[test]
-    fn assemble_non_convergence_reported_when_pass_limit_too_low() {
-        // This program needs two passes to shrink LDA's forward reference to
-        // zero page; capping at one pass must surface as an error rather
-        // than silently emitting the wrong (unconverged) bytes.
-        let errors = assemble_with_pass_limit(".org $0200\nLDA forward\nforward = $10\n", 1)
-            .expect_err("expected non-convergence error");
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.message().contains("did not converge"))
-        );
-    }
-
-    #[test]
-    fn assemble_defaults_to_cmos_variant_rejecting_wdc_only_mnemonics() {
-        let errors = assemble_err(".org $8000\nSTP\n");
-        assert!(errors.iter().any(|e| e.message().contains("not supported")));
-    }
-
-    #[test]
-    fn assemble_setcpu_enables_wdc_only_mnemonics() {
-        let output = assemble_ok(".setcpu \"wdc65c02\"\n.org $8000\nSTP\n");
-        assert_eq!(output.segments[0].bytes, vec![0xDB]);
-    }
-
-    #[test]
-    fn assemble_setcpu_takes_effect_only_from_that_point_onward() {
-        // STP before the .setcpu must still fail even though the source as a
-        // whole selects the Wdc65C02 variant partway through.
-        let errors = assemble_err(".org $8000\nSTP\n.setcpu \"wdc65c02\"\nSTP\n");
-        assert!(errors.iter().any(|e| e.message().contains("not supported")));
-    }
-
-    #[test]
-    fn assemble_setcpu_can_switch_back_to_cmos() {
-        // The first STP (under wdc65c02) must succeed; only the second, after
-        // switching back to 65c02, should fail.
-        let errors =
-            assemble_err(".org $8000\n.setcpu \"wdc65c02\"\nSTP\n.setcpu \"65c02\"\nSTP\n");
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].message().contains("not supported"));
-    }
-
-    #[test]
-    fn assemble_setcpu_unknown_variant_error() {
-        let errors = assemble_err(".setcpu \"6809\"\n");
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.message().contains("unknown CPU variant"))
-        );
-    }
 }

@@ -8,13 +8,13 @@
 
 use std::collections::HashMap;
 
-use super::error::Error;
-use super::eval::evaluate;
-use super::expr::{Expr, Operand};
 use super::instructions::InstructionTable;
-use super::parser::Parser;
-use super::token::TokenType;
 use crate::mos6502::cpu::opcodes::{AddressingMode, DecodedOp, Mnemonic};
+use emma6k_core::asm::Error;
+use emma6k_core::asm::Parser;
+use emma6k_core::asm::eval::evaluate;
+use emma6k_core::asm::expr::{Expr, Operand};
+use emma6k_core::asm::token::TokenType;
 use emma6k_core::location::Location;
 
 /// The addressing-mode syntax written after a mnemonic, before it has been

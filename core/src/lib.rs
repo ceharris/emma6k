@@ -15,6 +15,7 @@
 //! its CPU around a [`MachineState`]. This crate never names a CPU-specific
 //! type; the compiler enforces that.
 
+pub mod asm;
 pub mod bus;
 pub mod config;
 pub mod device;
@@ -28,7 +29,7 @@ pub mod trace;
 pub mod transport;
 pub mod watch;
 
-// Shared source-text helpers, used by `watch` here and by CPU crates' assemblers.
+// Shared source-text helpers, used by `watch` and `asm` here and by CPU crates' disassemblers.
 pub mod location;
 pub mod text;
 
