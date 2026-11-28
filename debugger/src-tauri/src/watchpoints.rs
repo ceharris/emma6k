@@ -6,11 +6,12 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use emma65::emulator::{Cpu, SymbolTable, map_flag_name, map_register_name};
+use emma65::emulator::SymbolTable;
 use emma65::watch::{WatchCompiler, WatchEvaluator};
 use tauri::State;
 
 use crate::CpuState;
+use crate::cpu::{DebugCpu, WatchNames};
 use crate::profile::ProfileDirState;
 
 /// Tauri-managed state wrapping the debugger's own watchpoint evaluator.
@@ -67,12 +68,24 @@ pub struct WatchpointsSnapshot {
     pub variables: Vec<VariableRow>,
 }
 
-/// Loads and compiles `dir/watchpoints.emw` against `symbol_table`, along with
-/// each watchpoint's enabled state from `dir/watchpoints.enabled`. A missing
-/// `.emw` file means zero watchpoints, not an error.
+/// A compiler for watchpoint expressions on a CPU whose register and flag names are
+/// `names`, resolving symbols against `symbol_table`.
+fn watch_compiler(names: WatchNames, symbol_table: &SymbolTable) -> WatchCompiler {
+    let table = symbol_table.clone();
+    WatchCompiler::new(names.register, names.flag, move |name| {
+        table.address_for(name).map(|a| a as u32)
+    })
+}
+
+/// Loads and compiles `dir/watchpoints.emw` against `symbol_table` and a CPU whose
+/// register and flag names are `names`, along with each watchpoint's enabled state
+/// from `dir/watchpoints.enabled`. A missing `.emw` file means zero watchpoints, not
+/// an error. A file written for another CPU reports its unknown names as a compile
+/// error.
 pub fn load_watchpoints_from(
     dir: &Path,
     symbol_table: &SymbolTable,
+    names: WatchNames,
 ) -> Result<(WatchEvaluator, Vec<bool>), String> {
     let path = dir.join("watchpoints.emw");
     let source = match std::fs::read_to_string(&path) {
@@ -82,10 +95,7 @@ pub fn load_watchpoints_from(
         }
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    let table = symbol_table.clone();
-    let mut compiler = WatchCompiler::new(map_register_name, map_flag_name, move |name| {
-        table.address_for(name).map(|a| a as u32)
-    });
+    let mut compiler = watch_compiler(names, symbol_table);
     let mut evaluator = WatchEvaluator::new();
     let (watchpoints, errors) = compiler.compile_all(&source, &mut evaluator);
     if !errors.is_empty() {
@@ -136,7 +146,7 @@ fn load_enabled_from(dir: &Path, count: usize) -> Vec<bool> {
 /// stay visible to later watchpoints), but their row always reports
 /// `triggered: false` and no error, since a disabled watchpoint's status is
 /// meaningless to the user.
-fn build_snapshot(cpu: Option<&Cpu>, watch: &mut WatchData) -> WatchpointsSnapshot {
+fn build_snapshot(cpu: Option<&DebugCpu>, watch: &mut WatchData) -> WatchpointsSnapshot {
     if let Some(err) = &watch.compile_error {
         return WatchpointsSnapshot {
             compile_error: Some(err.clone()),
@@ -205,7 +215,7 @@ fn collect_variables(evaluator: &WatchEvaluator) -> Vec<VariableRow> {
         .collect()
 }
 
-/// Rebuilds `cpu`'s own watch evaluator — the one `Cpu::step()` consults to
+/// Rebuilds `cpu`'s own watch evaluator — the one `step()` consults to
 /// halt execution — from `evaluator`'s currently *enabled* watchpoints, so
 /// panel watchpoints actually stop the running CPU instead of only being
 /// reflected in the display snapshot, and disabled ones never participate in
@@ -216,14 +226,11 @@ fn collect_variables(evaluator: &WatchEvaluator) -> Vec<VariableRow> {
 /// storage (`evaluator`'s display re-evaluation must never perturb the state
 /// `step()` relies on for real halting).
 pub fn sync_cpu_evaluator(
-    cpu: &mut Cpu,
+    cpu: &mut DebugCpu,
     evaluator: &WatchEvaluator,
     enabled: &[bool],
 ) -> Result<(), String> {
-    let table = cpu.bus().symbol_table().clone();
-    let mut compiler = WatchCompiler::new(map_register_name, map_flag_name, move |name| {
-        table.address_for(name).map(|a| a as u32)
-    });
+    let mut compiler = watch_compiler(cpu.watch_names(), cpu.bus().symbol_table());
     let sources: Vec<&str> = evaluator
         .watchpoints()
         .iter()
@@ -300,10 +307,7 @@ pub fn add_watchpoint(
     }
     let mut cpu_guard = cpu_state.0.lock().unwrap();
     let cpu = cpu_guard.as_mut().ok_or("CPU not ready")?;
-    let table = cpu.bus().symbol_table().clone();
-    let mut compiler = WatchCompiler::new(map_register_name, map_flag_name, move |name| {
-        table.address_for(name).map(|a| a as u32)
-    });
+    let mut compiler = watch_compiler(cpu.watch_names(), cpu.bus().symbol_table());
     let watchpoint = compiler
         .compile(&source, &mut watch.evaluator)
         .map_err(|e| e.to_string())?;
@@ -361,11 +365,9 @@ pub fn remove_watchpoint(
 fn recompile_sources(
     sources: &[String],
     symbol_table: &SymbolTable,
+    names: WatchNames,
 ) -> Result<WatchEvaluator, String> {
-    let table = symbol_table.clone();
-    let mut compiler = WatchCompiler::new(map_register_name, map_flag_name, move |name| {
-        table.address_for(name).map(|a| a as u32)
-    });
+    let mut compiler = watch_compiler(names, symbol_table);
     let mut evaluator = WatchEvaluator::new();
     for source in sources {
         let wp = compiler
@@ -408,7 +410,7 @@ pub fn edit_watchpoint(
         .map(|wp| wp.source().to_string())
         .collect();
     sources[index] = source;
-    watch.evaluator = recompile_sources(&sources, cpu.bus().symbol_table())?;
+    watch.evaluator = recompile_sources(&sources, cpu.bus().symbol_table(), cpu.watch_names())?;
     sync_cpu_evaluator(cpu, &watch.evaluator, &watch.enabled)?;
     save_watchpoints_to(
         &profile_dir.0.lock().unwrap().clone(),
@@ -456,11 +458,34 @@ pub fn toggle_watchpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use emma6k::family::Family;
     use emma65::emulator::cpu::StepResult;
-    use emma65::emulator::{AddressRange, Bus, CpuVariant};
+    use emma65::emulator::{AddressRange, Bus, Cpu, CpuVariant, Processor};
+
+    fn names_6502() -> WatchNames {
+        WatchNames::of(Family::Mos6502)
+    }
+
+    /// Steps a 6502 `cpu` once, returning the PC a watchpoint halted at, if one did.
+    fn step(cpu: &mut DebugCpu) -> Option<u16> {
+        let DebugCpu::Mos6502(cpu) = cpu else {
+            panic!("a 6502 test CPU");
+        };
+        match cpu.step(None, true) {
+            StepResult::WatchTriggered { pc, .. } => Some(pc),
+            _ => None,
+        }
+    }
+
+    fn ram() -> Bus {
+        Bus::config()
+            .ram_with_fill(AddressRange::new(0x0000, 0xFFFF), 0)
+            .unwrap()
+            .build()
+    }
 
     /// Builds a CPU with 64KB RAM and a reset vector pointing to `start`.
-    fn make_cpu(start: u16) -> Cpu {
+    fn make_cpu(start: u16) -> DebugCpu {
         let mut bus = Bus::config()
             .ram_with_fill(AddressRange::new(0x0000, 0xFFFF), 0)
             .unwrap()
@@ -469,7 +494,7 @@ mod tests {
         bus.write(0xFFFD, (start >> 8) as u8).unwrap();
         let mut cpu = Cpu::builder(CpuVariant::Wdc65C02).bus(bus).build().unwrap();
         cpu.reset().unwrap();
-        cpu
+        cpu.into()
     }
 
     #[test]
@@ -489,15 +514,10 @@ mod tests {
 
         assert!(!cpu.evaluator().is_empty());
 
-        let mut result = StepResult::Waiting;
-        for _ in 0..3 {
-            result = cpu.step(None, true);
-            if matches!(result, StepResult::WatchTriggered { .. }) {
-                break;
-            }
-        }
-        assert!(
-            matches!(result, StepResult::WatchTriggered { pc: 0x0203, .. }),
+        let halted_at = (0..3).find_map(|_| step(&mut cpu));
+        assert_eq!(
+            halted_at,
+            Some(0x0203),
             "expected watchpoint to halt execution at 0x0203"
         );
     }
@@ -535,13 +555,7 @@ mod tests {
         sync_cpu_evaluator(&mut cpu, &evaluator, &[false]).unwrap();
         assert!(cpu.evaluator().is_empty());
 
-        let mut halted = false;
-        for _ in 0..3 {
-            if matches!(cpu.step(None, true), StepResult::WatchTriggered { .. }) {
-                halted = true;
-                break;
-            }
-        }
+        let halted = (0..3).any(|_| step(&mut cpu).is_some());
         assert!(
             !halted,
             "a disabled watchpoint must not halt execution even though its expression is true"
@@ -553,7 +567,7 @@ mod tests {
         let mut cpu = make_cpu(0x0200);
         cpu.bus_mut().write(0x0200, 0xA2).unwrap(); // LDX #$2A
         cpu.bus_mut().write(0x0201, 0x2A).unwrap();
-        cpu.step(None, true);
+        step(&mut cpu);
 
         let mut watch = WatchData {
             evaluator: evaluator_with(&["x := X"]),
@@ -614,7 +628,7 @@ mod tests {
             "X == 1".to_string(),
             "Y == 2".to_string(),
         ];
-        let evaluator = recompile_sources(&sources, &SymbolTable::new()).unwrap();
+        let evaluator = recompile_sources(&sources, &SymbolTable::new(), names_6502()).unwrap();
         let got: Vec<&str> = evaluator
             .watchpoints()
             .iter()
@@ -626,7 +640,7 @@ mod tests {
     #[test]
     fn recompile_sources_fails_on_invalid_expression() {
         let sources = vec!["A == 0".to_string(), "@@@".to_string()];
-        assert!(recompile_sources(&sources, &SymbolTable::new()).is_err());
+        assert!(recompile_sources(&sources, &SymbolTable::new(), names_6502()).is_err());
     }
 
     /// Returns a fresh, uniquely-named temp directory for one test's config files.
@@ -640,7 +654,7 @@ mod tests {
     }
 
     fn evaluator_with(sources: &[&str]) -> WatchEvaluator {
-        let mut compiler = WatchCompiler::new(map_register_name, map_flag_name, |_| None);
+        let mut compiler = watch_compiler(names_6502(), &SymbolTable::new());
         let mut evaluator = WatchEvaluator::new();
         for source in sources {
             let wp = compiler.compile(source, &mut evaluator).unwrap();
@@ -683,7 +697,8 @@ mod tests {
         let dir = temp_dir("round-trip");
         let evaluator = evaluator_with(&["A == 0", "X == 1"]);
         save_watchpoints_to(&dir, &evaluator, &[true, false]).unwrap();
-        let (reloaded, enabled) = load_watchpoints_from(&dir, &SymbolTable::new()).unwrap();
+        let (reloaded, enabled) =
+            load_watchpoints_from(&dir, &SymbolTable::new(), names_6502()).unwrap();
         let sources: Vec<&str> = reloaded
             .watchpoints()
             .iter()
@@ -700,7 +715,8 @@ mod tests {
         // Write only the .emw file, mirroring a watchpoints file saved before
         // enable/disable existed.
         std::fs::write(dir.join("watchpoints.emw"), "A == 0;\nX == 1;\n").unwrap();
-        let (reloaded, enabled) = load_watchpoints_from(&dir, &SymbolTable::new()).unwrap();
+        let (reloaded, enabled) =
+            load_watchpoints_from(&dir, &SymbolTable::new(), names_6502()).unwrap();
         assert_eq!(reloaded.watchpoints().len(), 2);
         assert_eq!(enabled, vec![true, true]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -711,9 +727,64 @@ mod tests {
         let dir = temp_dir("load-mismatched-enabled-count");
         std::fs::write(dir.join("watchpoints.emw"), "A == 0;\nX == 1;\n").unwrap();
         std::fs::write(dir.join("watchpoints.enabled"), "0\n").unwrap();
-        let (reloaded, enabled) = load_watchpoints_from(&dir, &SymbolTable::new()).unwrap();
+        let (reloaded, enabled) =
+            load_watchpoints_from(&dir, &SymbolTable::new(), names_6502()).unwrap();
         assert_eq!(reloaded.watchpoints().len(), 2);
         assert_eq!(enabled, vec![true, true]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 6809 with 64KB RAM, D = $1234, Z set, and $ABCD at $2000.
+    fn make_6809() -> DebugCpu {
+        let mut cpu = emma09::Cpu::builder().bus(ram()).build().unwrap();
+        cpu.bus_mut().write(0x2000, 0xAB).unwrap();
+        cpu.bus_mut().write(0x2001, 0xCD).unwrap();
+        let regs = cpu.registers_mut();
+        regs.set_d(0x1234);
+        regs.cc = emma09::cpu::cc::ConditionCodes::Z;
+        cpu.into()
+    }
+
+    #[test]
+    fn a_6809_watchpoint_uses_its_register_and_flag_names_and_big_endian_words() {
+        let cpu = make_6809();
+        let names = cpu.watch_names();
+        let mut compiler = watch_compiler(names, &SymbolTable::new());
+        let mut evaluator = WatchEvaluator::new();
+        for source in ["D == $1234", "`Z", "`C", "W[$2000] == $ABCD", "U == 0"] {
+            let wp = compiler.compile(source, &mut evaluator).unwrap();
+            evaluator.add(wp);
+        }
+        let mut watch = WatchData {
+            evaluator,
+            compile_error: None,
+            enabled: vec![true; 5],
+        };
+        let snapshot = build_snapshot(Some(&cpu), &mut watch);
+        let triggered: Vec<bool> = snapshot.rows.iter().map(|r| r.triggered).collect();
+        assert_eq!(triggered, [true, true, false, true, true]);
+    }
+
+    #[test]
+    fn a_6502_watchpoint_file_loaded_for_the_6809_reports_a_compile_error() {
+        let dir = temp_dir("load-6502-file-for-6809");
+        std::fs::write(dir.join("watchpoints.emw"), "P == 0;\n`D;\n").unwrap();
+        let err = load_watchpoints_from(&dir, &SymbolTable::new(), WatchNames::of(Family::Mc6809))
+            .err()
+            .expect("P and the D flag aren't 6809 names");
+        assert!(err.starts_with("watchpoints.emw:"), "{err}");
+        assert!(load_watchpoints_from(&dir, &SymbolTable::new(), names_6502()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_cpu_evaluator_compiles_with_the_6809_names() {
+        let mut cpu = make_6809();
+        let mut compiler = watch_compiler(cpu.watch_names(), &SymbolTable::new());
+        let mut evaluator = WatchEvaluator::new();
+        let wp = compiler.compile("DP == 0", &mut evaluator).unwrap();
+        evaluator.add(wp);
+        sync_cpu_evaluator(&mut cpu, &evaluator, &[true]).unwrap();
+        assert_eq!(cpu.evaluator().watchpoints().len(), 1);
     }
 }

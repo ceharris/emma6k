@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 emma65 = { path = "../.." }
+emma09 = { path = "../../emma09" }
+# The CLI package's library: the CPU families and how a configuration names its CPU.
+emma6k = { path = "../../cli" }
 tauri = { version = "2", features = [] }
 clap = { version = "4.0", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

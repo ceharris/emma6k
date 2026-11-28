@@ -3,11 +3,10 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use emma65::emulator::cpu::Registers;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::CpuState;
-use crate::cpu;
+use crate::cpu::DebugRegisters;
 use crate::cpu_bus::{CpuBusCache, snapshot_cpu_bus};
 use crate::disassembly::LiveSnapshotRx;
 
@@ -25,9 +24,11 @@ pub struct RegisterSnapshot {
     pub pc: u16,
     /// Bitmask of flags-register bits that changed on the most recent step (0 on initial load).
     pub changed_flags: u32,
-    /// True when the CPU executed STP and is now halted; auto-step should stop.
+    /// True when the CPU has stopped (the 6502's STP, or a program's exit request);
+    /// auto-step should stop.
     pub cpu_stopped: bool,
-    /// True when the CPU executed WAI and is waiting for an interrupt.
+    /// True when the CPU is waiting for an interrupt (the 6502's WAI; the 6809's CWAI
+    /// or SYNC).
     pub cpu_waiting: bool,
     /// True when the post-step PC matches a breakpoint address; auto-step should stop.
     pub breakpoint_hit: bool,
@@ -36,15 +37,15 @@ pub struct RegisterSnapshot {
 impl RegisterSnapshot {
     /// A snapshot of `regs`, with `changed_flags` and the halt flags as given.
     pub fn new(
-        regs: &Registers,
+        regs: &DebugRegisters,
         changed_flags: u32,
         cpu_stopped: bool,
         cpu_waiting: bool,
         breakpoint_hit: bool,
     ) -> Self {
         Self {
-            values: cpu::register_values(regs),
-            pc: regs.pc,
+            values: regs.values(),
+            pc: regs.pc(),
             changed_flags,
             cpu_stopped,
             cpu_waiting,
@@ -71,17 +72,17 @@ pub fn set_register(
     let mut guard = cpu_state.0.lock().unwrap();
     let cpu = guard.as_mut().ok_or("CPU not ready")?;
 
-    let flags_before = cpu::flags_value(cpu.registers());
-    cpu::set_register_value(cpu.registers_mut(), &name, value)?;
+    let flags_before = cpu.registers().flags();
+    cpu.set_register(&name, value)?;
 
-    let regs = *cpu.registers();
-    let changed = flags_before ^ cpu::flags_value(&regs);
+    let regs = cpu.registers();
+    let changed = flags_before ^ regs.flags();
     *changed_flags_state.0.lock().unwrap() = changed;
     *cpu_bus_cache.0.lock().unwrap() = snapshot_cpu_bus(cpu);
 
     let snapshot = RegisterSnapshot::new(&regs, changed, cpu.is_stopped(), cpu.is_waiting(), false);
 
-    let _ = app.emit("debugger-halted", regs.pc);
+    let _ = app.emit("debugger-halted", regs.pc());
     Ok(snapshot)
 }
 
@@ -99,7 +100,7 @@ pub fn get_registers(
     if let Some(cpu) = guard.as_ref() {
         let changed_flags = *changed_flags_state.0.lock().unwrap();
         return Ok(RegisterSnapshot::new(
-            cpu.registers(),
+            &cpu.registers(),
             changed_flags,
             cpu.is_stopped(),
             cpu.is_waiting(),
@@ -107,13 +108,7 @@ pub fn get_registers(
         ));
     }
     // CPU is free-running — read from the live snapshot channel.
-    let live = live_snapshot_rx
-        .0
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|rx| rx.borrow().clone())
-        .ok_or("CPU not ready")?;
+    let live = live_snapshot_rx.latest().ok_or("CPU not ready")?;
     Ok(RegisterSnapshot::new(
         &live.registers,
         0,

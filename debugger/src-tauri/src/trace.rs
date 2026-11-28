@@ -8,14 +8,15 @@ use std::thread::JoinHandle;
 
 use tauri::State;
 
-use emma65::disassembler::{Disassembler, TraceBusOp, TraceRowAssembler};
-use emma65::emulator::{
-    BinaryTraceReader, BinaryTraceWriter, ChannelTraceCallback, OverflowPolicy, Registers,
-    TraceCallback, TraceKind, TraceRecord, spawn_trace_writer,
+use emma65::emulator::SymbolTable;
+use emma65::emulator::text::immediate_comment;
+use emma65::emulator::trace::{
+    BinaryTraceReader, BinaryTraceWriter, ChannelTraceCallback, OverflowPolicy, TraceCallback,
+    TraceKind, TraceRecord, TraceRegisters, spawn_trace_writer,
 };
 
 use crate::CpuState;
-use crate::cpu;
+use crate::cpu::{DebugCpu, DebugRegisters};
 
 /// Capacity of the bounded channel between the CPU thread and the trace writer thread.
 const TRACE_CHANNEL_CAPACITY: usize = 4096;
@@ -59,14 +60,14 @@ impl Default for TraceData {
 /// Wraps a [`ChannelTraceCallback`], counting records and indexing the start
 /// of each row (its `Registers` record) into a shared `row_index`, the same
 /// way `DisassemblingTraceCallback` wraps a callback in the library.
-struct RowIndexingTraceCallback {
-    inner: ChannelTraceCallback,
+struct RowIndexingTraceCallback<R> {
+    inner: ChannelTraceCallback<R>,
     row_index: Arc<Mutex<Vec<u64>>>,
     record_count: u64,
 }
 
-impl TraceCallback<Registers> for RowIndexingTraceCallback {
-    fn record(&mut self, rec: TraceRecord) {
+impl<R: Send> TraceCallback<R> for RowIndexingTraceCallback<R> {
+    fn record(&mut self, rec: TraceRecord<R>) {
         if matches!(rec.kind, TraceKind::Registers(_)) {
             self.row_index.lock().unwrap().push(self.record_count);
         }
@@ -96,23 +97,25 @@ pub struct TraceBusOpDto {
 /// One reconstructed trace row returned to the frontend.
 #[derive(Clone, serde::Serialize)]
 pub struct TraceRowDto {
-    /// 1-based sequence number (`instr_id + 1`), matching the `emma65-tracer` CLI's numbering.
+    /// 1-based sequence number (`instr_id + 1`), matching the `emma6k-tracer` CLI's numbering.
     pub seq: u64,
-    /// Instruction address.
+    /// Instruction address (for a serviced interrupt, the PC it interrupted).
     pub addr: u16,
-    /// Raw bytes as hex strings, e.g. ["4C", "00", "06"].
+    /// Raw bytes as hex strings, e.g. ["4C", "00", "06"]; empty for an interrupt row.
     pub bytes: Vec<String>,
     /// Symbol names from the symbol table associated with `addr`, without trailing colons.
     pub labels: Vec<String>,
-    /// Mnemonic string, e.g. "JMP".
+    /// Mnemonic string, e.g. "JMP", or for a serviced interrupt its name in angle
+    /// brackets, e.g. "<IRQ>", as `emma6k-tracer` shows it.
     pub mnemonic: String,
-    /// Formatted operand text, e.g. "$0600".
+    /// Formatted operand text, e.g. "$0600"; for an interrupt row, its vector, e.g.
+    /// "[$FFF8]".
     pub operand: String,
     /// Comment string.
     pub comment: String,
     /// False for invalid opcodes under the active variant.
     pub is_valid: bool,
-    /// The instruction's total cycle count, if known.
+    /// The instruction's (or interrupt's) total cycle count, if known.
     pub cycles: Option<u8>,
     /// Every register in the CPU description, keyed by its name, as it stood immediately
     /// before this instruction executed.
@@ -152,23 +155,19 @@ pub fn record_trace(
     let cpu = cpu_guard.as_mut().ok_or("CPU not ready")?;
 
     let file = File::create(&path).map_err(|e| e.to_string())?;
-    let writer = BinaryTraceWriter::new(file, cpu.variant());
-    // BlockOnFull, unlike the CLI capture use case's DropOnFull: a debugger
-    // trace that silently drops instructions would be misleading. `Cpu::flush_trace`
-    // is called once per debugger step/run command (see `exec::step_into` and
-    // friends), not per record (which cratered free-run throughput, issue #273),
-    // so get_trace_window's independent file handle sees every row from a command
-    // by the time its `debugger-halted`/`debugger-run-stopped` event fires.
-    let (callback, writer_handle, _dropped) =
-        spawn_trace_writer(writer, TRACE_CHANNEL_CAPACITY, OverflowPolicy::BlockOnFull);
-
     let row_index = Arc::new(Mutex::new(Vec::new()));
-    let indexing_callback = RowIndexingTraceCallback {
-        inner: callback,
-        row_index: Arc::clone(&row_index),
-        record_count: 0,
+    let writer_handle = match cpu {
+        DebugCpu::Mos6502(cpu) => {
+            let (callback, handle) = start_writer(file, cpu.variant(), &row_index);
+            cpu.set_trace_callback(Some(callback));
+            handle
+        }
+        DebugCpu::Mc6809(cpu) => {
+            let (callback, handle) = start_writer(file, cpu.variant(), &row_index);
+            cpu.set_trace_callback(Some(callback));
+            handle
+        }
     };
-    cpu.set_trace_callback(Some(Box::new(indexing_callback)));
 
     let mut state = trace_state.0.lock().unwrap();
     state.path = Some(PathBuf::from(&path));
@@ -177,6 +176,30 @@ pub fn record_trace(
     state.writer_handle = Some(writer_handle);
 
     Ok(())
+}
+
+/// Starts a writer thread recording `R`'s trace to `file`, and returns the callback
+/// to install on the CPU, which also indexes each row's start into `row_index`.
+fn start_writer<R: TraceRegisters>(
+    file: File,
+    variant: R::Variant,
+    row_index: &Arc<Mutex<Vec<u64>>>,
+) -> (Box<dyn TraceCallback<R>>, JoinHandle<()>) {
+    let writer = BinaryTraceWriter::<File, R>::new(file, variant);
+    // BlockOnFull, unlike the CLI capture use case's DropOnFull: a debugger
+    // trace that silently drops instructions would be misleading. `flush_trace`
+    // is called once per debugger step/run command (see `exec::step_into` and
+    // friends), not per record (which cratered free-run throughput, issue #273),
+    // so get_trace_window's independent file handle sees every row from a command
+    // by the time its `debugger-halted`/`debugger-run-stopped` event fires.
+    let (callback, writer_handle, _dropped) =
+        spawn_trace_writer(writer, TRACE_CHANNEL_CAPACITY, OverflowPolicy::BlockOnFull);
+    let indexing_callback = RowIndexingTraceCallback {
+        inner: callback,
+        row_index: Arc::clone(row_index),
+        record_count: 0,
+    };
+    (Box::new(indexing_callback), writer_handle)
 }
 
 /// Stops the current recording: detaches the trace callback and waits for the
@@ -188,8 +211,10 @@ pub fn stop_trace(
     trace_state: State<TraceState>,
 ) -> Result<(), String> {
     let mut cpu_guard = cpu_state.0.lock().unwrap();
-    let cpu = cpu_guard.as_mut().ok_or("CPU not ready")?;
-    cpu.set_trace_callback(None);
+    match cpu_guard.as_mut().ok_or("CPU not ready")? {
+        DebugCpu::Mos6502(cpu) => cpu.set_trace_callback(None),
+        DebugCpu::Mc6809(cpu) => cpu.set_trace_callback(None),
+    }
     drop(cpu_guard);
 
     let mut state = trace_state.0.lock().unwrap();
@@ -235,13 +260,60 @@ pub fn get_trace_window(
     // Opened fresh per call: simplest option, and an extra open/close per
     // viewport-sized fetch is cheap relative to a UI-paced scroll/poll action.
     let file = File::open(path).map_err(|e| e.to_string())?;
+    let count = count.min(total_rows - start_row);
+    let symbols = cpu.bus().symbol_table().clone();
+    let rows = match cpu {
+        DebugCpu::Mos6502(cpu) => read_rows_6502(file, seek_record, count, cpu.variant(), symbols),
+        DebugCpu::Mc6809(_) => read_rows_6809(file, seek_record, count, symbols),
+    }?;
+
+    Ok(TraceWindowPage { rows, total_rows })
+}
+
+/// Opens `file` as `R`'s trace, positioned at record `seek_record`.
+fn open_reader<R: TraceRegisters>(
+    file: File,
+    seek_record: u64,
+) -> Result<BinaryTraceReader<File, R>, String> {
     let mut reader = BinaryTraceReader::new(file).map_err(|e| e.to_string())?;
     reader
         .seek_to_record(seek_record)
         .map_err(|e| e.to_string())?;
+    Ok(reader)
+}
 
-    let mut assembler = TraceRowAssembler::new(cpu.variant(), cpu.bus().symbol_table().clone());
-    let mut rows = Vec::with_capacity(count.min(total_rows - start_row));
+/// Converts a family's `TraceBusOp`s; both families' have the same shape.
+macro_rules! bus_op_dtos {
+    ($ops:expr, $op:path) => {{
+        use $op as Op;
+        $ops.map(|op| {
+            let (addr, kind, value) = match *op {
+                Op::Read { addr, value } => (addr, "Read", value),
+                Op::Write { addr, value } => (addr, "Write", value),
+            };
+            TraceBusOpDto {
+                addr,
+                op: kind.to_string(),
+                value,
+                comment: immediate_comment(value),
+            }
+        })
+        .collect()
+    }};
+}
+
+/// Reconstructs up to `count` 6502 rows from record `seek_record` on.
+fn read_rows_6502(
+    file: File,
+    seek_record: u64,
+    count: usize,
+    variant: emma65::emulator::CpuVariant,
+    symbols: SymbolTable,
+) -> Result<Vec<TraceRowDto>, String> {
+    use emma65::disassembler::{TraceBusOp, TraceRowAssembler};
+    let reader = open_reader::<emma65::emulator::Registers>(file, seek_record)?;
+    let mut assembler = TraceRowAssembler::new(variant, symbols);
+    let mut rows = Vec::with_capacity(count);
     for item in reader {
         if rows.len() >= count {
             break;
@@ -250,45 +322,88 @@ pub fn get_trace_window(
         if let Some(row) = assembler.feed(&rec) {
             // Computed up front: it borrows `row` as a whole via `non_fetch_bus_ops(&self)`,
             // which the field-by-field moves out of `row.line` below would otherwise block.
-            let bus_ops = row
-                .non_fetch_bus_ops()
-                .map(|op| match *op {
-                    TraceBusOp::Read { addr, value } => TraceBusOpDto {
-                        addr,
-                        op: "Read".to_string(),
-                        value,
-                        comment: Disassembler::immediate_mode_comment(value),
-                    },
-                    TraceBusOp::Write { addr, value } => TraceBusOpDto {
-                        addr,
-                        op: "Write".to_string(),
-                        value,
-                        comment: Disassembler::immediate_mode_comment(value),
-                    },
-                })
-                .collect();
+            let bus_ops = bus_op_dtos!(row.non_fetch_bus_ops(), TraceBusOp);
             rows.push(TraceRowDto {
                 seq: row.instr_id + 1,
                 addr: row.line.addr,
-                bytes: row
-                    .line
-                    .raw_bytes
-                    .iter()
-                    .map(|b| format!("{b:02X}"))
-                    .collect(),
+                bytes: hex_bytes(&row.line.raw_bytes),
                 labels: row.line.labels,
                 mnemonic: row.line.mnemonic.to_string(),
                 operand: row.line.operand_text,
                 comment: row.line.comment_text.unwrap_or_default(),
                 is_valid: row.line.is_valid,
                 cycles: row.cycles,
-                registers: cpu::register_values(&row.regs),
+                registers: DebugRegisters::from(row.regs).values(),
                 bus_ops,
             });
         }
     }
+    Ok(rows)
+}
 
-    Ok(TraceWindowPage { rows, total_rows })
+/// Reconstructs up to `count` 6809 rows from record `seek_record` on. A serviced
+/// interrupt, which fetches no instruction, becomes a row named from its vector, as
+/// `emma6k-tracer` shows it: `<IRQ>` and `[$FFF8]`, at the PC it interrupted.
+fn read_rows_6809(
+    file: File,
+    seek_record: u64,
+    count: usize,
+    symbols: SymbolTable,
+) -> Result<Vec<TraceRowDto>, String> {
+    use emma09::disassembler::trace::vector_name;
+    use emma09::disassembler::{TraceBusOp, TraceRowAssembler};
+    let reader = open_reader::<emma09::Registers>(file, seek_record)?;
+    let mut assembler = TraceRowAssembler::new(symbols);
+    let mut rows = Vec::with_capacity(count);
+    for item in reader {
+        if rows.len() >= count {
+            break;
+        }
+        let rec = item.map_err(|e| e.to_string())?;
+        let Some(row) = assembler.feed(&rec) else {
+            continue;
+        };
+        let bus_ops = bus_op_dtos!(row.non_fetch_bus_ops(), TraceBusOp);
+        let registers = DebugRegisters::from(row.regs).values();
+        let dto = match row.line {
+            Some(line) => TraceRowDto {
+                seq: row.instr_id + 1,
+                addr: line.addr,
+                bytes: hex_bytes(&line.raw_bytes),
+                labels: line.labels,
+                mnemonic: line.mnemonic.to_string(),
+                operand: line.operand_text,
+                comment: line.comment_text.unwrap_or_default(),
+                is_valid: line.is_valid,
+                cycles: row.cycles,
+                registers,
+                bus_ops,
+            },
+            None => {
+                let vector = row.vector();
+                let name = vector.and_then(vector_name).unwrap_or("INT");
+                TraceRowDto {
+                    seq: row.instr_id + 1,
+                    addr: row.regs.pc,
+                    bytes: Vec::new(),
+                    labels: Vec::new(),
+                    mnemonic: format!("<{name}>"),
+                    operand: vector.map(|v| format!("[${v:04X}]")).unwrap_or_default(),
+                    comment: String::new(),
+                    is_valid: true,
+                    cycles: row.cycles,
+                    registers,
+                    bus_ops,
+                }
+            }
+        };
+        rows.push(dto);
+    }
+    Ok(rows)
+}
+
+fn hex_bytes(bytes: &[u8]) -> Vec<String> {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
 /// Returns the current recording status, letting the toolbar restore
@@ -299,5 +414,83 @@ pub fn get_trace_status(trace_state: State<TraceState>) -> TraceStatus {
     TraceStatus {
         recording: state.recording,
         path: state.path.as_ref().map(|p| p.display().to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use emma65::emulator::bus::{AddressRange, Bus};
+    use emma65::emulator::{IrqSource, Processor};
+
+    /// Records `steps` steps of a 6809 that takes an IRQ before its first instruction,
+    /// then reads the rows back.
+    fn record_6809_irq(steps: usize) -> Vec<TraceRowDto> {
+        let mut bus = Bus::config()
+            .ram_with_fill(AddressRange::new(0x0000, 0xffff), 0)
+            .unwrap()
+            .build();
+        bus.patch(0xfff8, 0x20); // IRQ vector: $2000
+        bus.patch(0xfff9, 0x00);
+        bus.patch(0x2000, 0x3b); // RTI
+        bus.patch(0x1000, 0x12); // NOP
+        let mut cpu = emma09::Cpu::builder().bus(bus).build().unwrap();
+        let regs = cpu.registers_mut();
+        regs.pc = 0x1000;
+        regs.s = 0x8000;
+        regs.cc = emma09::cpu::cc::ConditionCodes::empty();
+
+        let dir = std::env::temp_dir().join(format!(
+            "emma6k-trace-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("irq.e65t");
+        let row_index = Arc::new(Mutex::new(Vec::new()));
+        let (callback, handle) =
+            start_writer(File::create(&path).unwrap(), cpu.variant(), &row_index);
+        cpu.set_trace_callback(Some(callback));
+
+        let source = IrqSource(1);
+        cpu.interrupts_mut().assert_irq(source);
+        for step in 0..steps {
+            cpu.step(None, false);
+            if step == 0 {
+                cpu.interrupts_mut().release_irq(source);
+            }
+        }
+        cpu.set_trace_callback(None);
+        handle.join().unwrap();
+        assert_eq!(row_index.lock().unwrap().len(), steps);
+
+        let rows = read_rows_6809(File::open(&path).unwrap(), 0, 10, SymbolTable::new()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        rows
+    }
+
+    #[test]
+    fn a_serviced_6809_interrupt_is_a_row_named_from_its_vector() {
+        let rows = record_6809_irq(3);
+        let summary: Vec<_> = rows
+            .iter()
+            .map(|r| (r.addr, r.mnemonic.as_str(), r.operand.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (0x1000, "<IRQ>", "[$FFF8]"),
+                (0x2000, "RTI", ""),
+                (0x1000, "NOP", ""),
+            ]
+        );
+        let irq = &rows[0];
+        assert!(irq.bytes.is_empty());
+        assert_eq!(irq.cycles, Some(19));
+        assert_eq!(irq.registers["PC"], 0x1000);
+        assert_eq!(irq.registers["S"], 0x8000);
+        // The entire state is stacked: twelve bytes below $8000.
+        let writes = irq.bus_ops.iter().filter(|op| op.op == "Write").count();
+        assert_eq!(writes, 12);
+        assert_eq!(rows[1].registers["S"], 0x8000 - 12);
     }
 }

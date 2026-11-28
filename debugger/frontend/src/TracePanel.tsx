@@ -2,7 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import type { RegisterDescription } from "./cpuDescription";
+import {
+  formatInstructionBytes,
+  instructionBytesWidth,
+  type RegisterDescription,
+} from "./cpuDescription";
 import { useCpuDescription } from "./CpuDescriptionContext";
 import { formatFlags, formatRegister, traceRegisters } from "./traceFormat";
 import "./styles/trace.scss";
@@ -50,13 +54,6 @@ function formatByte(b: number): string {
   return b.toString(16).toUpperCase().padStart(2, "0");
 }
 
-function formatBytes(bytes: string[]): string {
-  return bytes
-    .map((b) => b.padStart(2, "0"))
-    .join(" ")
-    .padEnd(8, " ");
-}
-
 /** Basename of a file path, for the compact toolbar path display. */
 function basename(path: string): string {
   return path.split(/[/\\]/).pop() ?? path;
@@ -68,7 +65,13 @@ function basename(path: string): string {
  * content is bottom-anchored) but need identical `<col>` widths to stay
  * visually aligned as columns.
  */
-function TraceColGroup({ registers }: { registers: RegisterDescription[] }) {
+function TraceColGroup({
+  registers,
+  maxInstructionLen,
+}: {
+  registers: RegisterDescription[];
+  maxInstructionLen: number;
+}) {
   return (
     <colgroup>
       <col className="col-seq" />
@@ -78,7 +81,10 @@ function TraceColGroup({ registers }: { registers: RegisterDescription[] }) {
       ))}
       <col className="col-flags" />
       <col className="col-addr" />
-      <col className="col-bytes" />
+      <col
+        className="col-bytes"
+        style={{ width: `${instructionBytesWidth(maxInstructionLen) + 3}ch` }}
+      />
       <col className="col-mnemonic" />
       <col className="col-operand" />
       <col />
@@ -95,6 +101,7 @@ export default function TracePanel() {
   const description = useCpuDescription();
   const registers = description === null ? [] : traceRegisters(description);
   const flagsRegister = description?.flags_register;
+  const maxInstructionLen = description?.max_instruction_len ?? 3;
   // Seq#, Cyc, a column per register, and Flags lead each row; Addr, Code and the
   // three Instruction columns follow.
   const leadingColumns = registers.length + 3;
@@ -349,7 +356,7 @@ export default function TracePanel() {
         <div className="trace-log-area">
           <div className="trace-log-header">
             <table className="trace-table">
-              <TraceColGroup registers={registers} />
+              <TraceColGroup registers={registers} maxInstructionLen={maxInstructionLen} />
               <thead>
                 <tr>
                   <th>Seq#</th>
@@ -368,7 +375,7 @@ export default function TracePanel() {
           <div className="trace-log-scroller">
             <div className="trace-log-body" ref={logBodyRef} onWheel={handleWheel}>
               <table className="trace-table">
-                <TraceColGroup registers={registers} />
+                <TraceColGroup registers={registers} maxInstructionLen={maxInstructionLen} />
                 <tbody>
                   {rows.length === 0 ? (
                     <tr className="trace-empty-row">
@@ -405,7 +412,9 @@ export default function TracePanel() {
                               : ""}
                           </td>
                           <td className="trace-addr">{formatAddr(row.addr)}</td>
-                          <td className="trace-bytes">{formatBytes(row.bytes)}</td>
+                          <td className="trace-bytes">
+                            {formatInstructionBytes(row.bytes, maxInstructionLen)}
+                          </td>
                           <td className="trace-mnemonic">{row.mnemonic}</td>
                           <td className="trace-operand">{row.operand}</td>
                           <td className="trace-comment">{row.comment}</td>

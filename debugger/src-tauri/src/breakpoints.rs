@@ -9,10 +9,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-use emma65::emulator::{Cpu, SymbolTable};
+use emma65::emulator::SymbolTable;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::CpuState;
+use crate::cpu::DebugCpu;
 use crate::profile::ProfileDirState;
 
 /// Debugger-tracked breakpoint records (`addr -> enabled`).
@@ -87,7 +88,7 @@ fn save_breakpoints_to(dir: &Path, breakpoints: &BTreeMap<u16, bool>) -> Result<
 /// Installs `breakpoints`' enabled addresses into `cpu`'s own breakpoint set,
 /// so a freshly loaded profile's breakpoints actually halt execution rather
 /// than only appearing in the panel and gutter.
-pub fn install_breakpoints(cpu: &mut Cpu, breakpoints: &BTreeMap<u16, bool>) {
+pub fn install_breakpoints(cpu: &mut DebugCpu, breakpoints: &BTreeMap<u16, bool>) {
     for (&addr, &enabled) in breakpoints {
         if enabled {
             cpu.add_breakpoint(addr);
@@ -297,11 +298,12 @@ mod tests {
             .build();
         bus.write(0xFFFC, 0x00).unwrap();
         bus.write(0xFFFD, 0x02).unwrap();
-        let mut cpu = Cpu::builder(emma65::emulator::CpuVariant::Wdc65C02)
+        let mut cpu = emma65::emulator::Cpu::builder(emma65::emulator::CpuVariant::Wdc65C02)
             .bus(bus)
             .build()
             .unwrap();
         cpu.reset().unwrap();
+        let mut cpu = DebugCpu::from(cpu);
 
         let mut bps = BTreeMap::new();
         bps.insert(0x0200, true);

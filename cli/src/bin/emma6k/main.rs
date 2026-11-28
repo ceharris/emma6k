@@ -6,7 +6,6 @@
 //! hot path never goes through dynamic dispatch.
 
 mod config;
-mod family;
 mod tty;
 
 use std::path::Path;
@@ -14,7 +13,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use crate::config::{AppConfig, RunPlan};
-use crate::family::Family;
+use emma6k::family::Family;
 use emma6k_core::exec::StepResult;
 use emma6k_core::session::EmulatorSession;
 use emma6k_core::{

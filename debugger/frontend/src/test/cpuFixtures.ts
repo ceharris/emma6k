@@ -1,7 +1,8 @@
 /**
- * Test fixtures for the CPU description and register snapshots: the 6502's description as
- * the backend sends it (`describe_6502` in `debugger/src-tauri/src/cpu.rs`), and a helper
- * that builds a 6502 register snapshot from per-register overrides.
+ * Test fixtures for the CPU description and register snapshots: the 6502's and the 6809's
+ * descriptions as the backend sends them (`describe_6502` and `describe_6809` in
+ * `debugger/src-tauri/src/cpu.rs`), and a helper that builds a 6502 register snapshot from
+ * per-register overrides.
  */
 import type { CpuDescription } from "../cpuDescription";
 import type { RegisterSnapshot } from "../RegisterPanel";
@@ -33,6 +34,39 @@ export const DESCRIPTION_6502: CpuDescription = {
   byte_order: "little",
   max_instruction_len: 3,
   assembler: true,
+};
+
+export const DESCRIPTION_6809: CpuDescription = {
+  family: "6809",
+  variant: "6809",
+  registers: [
+    { name: "A", width_bits: 8, role: "data" },
+    { name: "B", width_bits: 8, role: "data" },
+    { name: "D", width_bits: 16, role: "data" },
+    { name: "DP", width_bits: 8, role: "data" },
+    { name: "X", width_bits: 16, role: "index" },
+    { name: "Y", width_bits: 16, role: "index" },
+    { name: "U", width_bits: 16, role: "stack" },
+    { name: "S", width_bits: 16, role: "stack" },
+    { name: "PC", width_bits: 16, role: "pc" },
+    { name: "CC", width_bits: 8, role: "flags" },
+  ],
+  flags: [
+    { label: "E", bit: 7, name: "Entire state stacked" },
+    { label: "F", bit: 6, name: "FIRQ mask" },
+    { label: "H", bit: 5, name: "Half carry" },
+    { label: "I", bit: 4, name: "IRQ mask" },
+    { label: "N", bit: 3, name: "Negative" },
+    { label: "Z", bit: 2, name: "Zero" },
+    { label: "V", bit: 1, name: "Overflow" },
+    { label: "C", bit: 0, name: "Carry" },
+  ],
+  flags_register: "CC",
+  interrupt_lines: ["IRQ", "FIRQ", "NMI"],
+  stack: { pointer: "S", page_fixed: false },
+  byte_order: "big",
+  max_instruction_len: 5,
+  assembler: false,
 };
 
 /** 6502 register values, any of which a test can override. */

@@ -482,6 +482,17 @@
   color: var(--color-fg);
 }
 
+// The template's CPU family, a muted tag after its name.
+.modal-template-cpu {
+  margin-left: 0.6em;
+  padding: 0 0.4em;
+  border: 1px solid var(--color-border);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  color: var(--color-muted);
+}
+
 .modal-template-desc {
   font-size: var(--font-size-btn);
   color: var(--color-muted);

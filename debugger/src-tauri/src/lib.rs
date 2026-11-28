@@ -5,21 +5,24 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use figment::{
     Figment,
-    providers::{Env, Format, Toml},
+    providers::{Format, Serialized, Toml},
 };
 use tauri::{AppHandle, Emitter, Listener, Manager, State};
 use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_opener::OpenerExt;
 use tokio::sync::{mpsc, oneshot};
 
-use emma65::disassembler::Disassembler;
-use emma65::emulator::bus::MAX_IRQ_SOURCES;
+use emma6k::family::Family;
+use emma6k::variant::{env_source, variant_in};
+use emma65::emulator::bus::{DeviceIdAllocator, MAX_IRQ_SOURCES};
 use emma65::emulator::{
-    Config, Cpu, DeviceRegistry, DisplayFrame, DisplayFrameSlot, DisplayGeometrySlot,
-    EmulatorSession, InstantiationContext, InternalPipeTransport, IrqSource, LcdDisplayFrame,
-    LcdDisplayFrameSlot, LcdDisplayGeometrySlot, LedMatrixFrame, LedMatrixFrameSlot,
-    LedMatrixGeometrySlot, LogSender, Transport, TransportReporter, TransportSlot,
+    DeviceRegistry, DisplayFrame, DisplayFrameSlot, DisplayGeometrySlot, ErrorReceiver,
+    InstantiationContext, InternalPipeTransport, IrqSource, LcdDisplayFrame, LcdDisplayFrameSlot,
+    LcdDisplayGeometrySlot, LedMatrixFrame, LedMatrixFrameSlot, LedMatrixGeometrySlot, LogSender,
+    Transport, TransportReporter, TransportSlot,
 };
+
+use crate::cpu::DebugCpu;
 
 /// Label of the main debugger window, as assigned by the (unlabeled) first
 /// entry in `tauri.conf.json`'s `app.windows` list.
@@ -121,8 +124,12 @@ mod test_support;
 /// IRQ used by the debugger
 pub const DEBUGGER_IRQ: u32 = MAX_IRQ_SOURCES - 1;
 
+/// The interrupt source behind the debugger's FIRQ control, routed to FIRQ, for a CPU
+/// that has one (see `cpu_bus::install_ui_firq_source`).
+pub const DEBUGGER_FIRQ: u32 = MAX_IRQ_SOURCES - 2;
+
 /// Holds the CPU once the session is ready.
-pub struct CpuState(pub Mutex<Option<Cpu>>);
+pub struct CpuState(pub Mutex<Option<DebugCpu>>);
 
 /// Payload emitted to the frontend on the `session-status` event.
 #[derive(Clone, serde::Serialize)]
@@ -170,10 +177,12 @@ pub struct SessionStatusState(pub Mutex<Option<SessionStatus>>);
 /// into a struct because the function's return type otherwise exceeds clippy's type-complexity
 /// lint.
 struct LoadedSession {
-    session: EmulatorSession,
+    cpu: DebugCpu,
+    error_receiver: ErrorReceiver,
     remote: InternalPipeTransport,
     kbd_remote: InternalPipeTransport,
     ui_irq_source: IrqSource,
+    ui_firq_source: Option<IrqSource>,
     display_frame_rx: mpsc::Receiver<DisplayFrame>,
     display_geometry: Option<display::DisplayGeometryPayload>,
     led_matrix_frame_rx: mpsc::Receiver<LedMatrixFrame>,
@@ -182,14 +191,101 @@ struct LoadedSession {
     lcd_display_geometry: Option<lcd_display::LcdDisplayGeometryPayload>,
 }
 
+/// A profile's configuration, for the CPU family it names.
+enum FamilyConfig {
+    Mos6502(emma65::emulator::Config),
+    Mc6809(emma09::Config),
+}
+
+impl FamilyConfig {
+    /// Reads `config_path` (TOML < `EMMA6K_*` env), choosing the family from its
+    /// `cpu-variant` (or `cpu`) the way `emma6k` does: each source may use either
+    /// spelling but not both, and the environment wins. A profile that names no CPU is
+    /// a 6502 profile, as every debugger profile was before the 6809.
+    fn load(config_path: &Path) -> Result<Self, String> {
+        let config_error = |e: String| format!("Configuration error: {e}");
+
+        let file_variant = variant_in(
+            Figment::from(Toml::file(config_path)),
+            &config_path.display().to_string(),
+        )
+        .map_err(config_error)?;
+        let variant = variant_in(Figment::from(env_source()), "the environment")
+            .map_err(config_error)?
+            .or(file_variant);
+        let family = variant
+            .as_deref()
+            .map(Family::of)
+            .transpose()
+            .map_err(config_error)?
+            .unwrap_or(Family::Mos6502);
+
+        // Neither family's `Config` reads every spelling `emma6k` accepts (the 6809's
+        // has no `cpu` alias, and neither reads an unquoted `6809`), so rewrite the
+        // merged keys to one `cpu-variant` string before extracting, as `emma6k` does.
+        let mut keys: figment::value::Dict = Figment::new()
+            .merge(Toml::file(config_path))
+            .merge(env_source())
+            .extract()
+            .map_err(|e| config_error(e.to_string()))?;
+        keys.remove("cpu");
+        keys.remove("cpu-variant");
+        if let Some(variant) = variant {
+            keys.insert("cpu-variant".to_string(), variant.into());
+        }
+        let figment = Figment::from(Serialized::defaults(keys));
+        let extract_error = |e: figment::Error| config_error(e.to_string());
+        Ok(match family {
+            Family::Mos6502 => Self::Mos6502(figment.extract().map_err(extract_error)?),
+            Family::Mc6809 => Self::Mc6809(figment.extract().map_err(extract_error)?),
+        })
+    }
+
+    fn clock_speed_hz(&self) -> Option<u64> {
+        match self {
+            Self::Mos6502(config) => config.clock_speed_hz,
+            Self::Mc6809(config) => config.clock_speed_hz,
+        }
+    }
+
+    /// Builds the family's session with its own device registry (the 6809's leaves out
+    /// `pic/finch`).
+    async fn build(
+        &self,
+        context: InstantiationContext,
+    ) -> Result<(DebugCpu, ErrorReceiver, DeviceIdAllocator), String> {
+        let build_error =
+            |e: emma65::emulator::BuildError| format!("Failed to build emulator session: {e}");
+        Ok(match self {
+            Self::Mos6502(config) => {
+                let session = config
+                    .build_with_context(&DeviceRegistry::with_builtins(), context)
+                    .await
+                    .map_err(build_error)?;
+                (
+                    session.cpu.into(),
+                    session.error_receiver,
+                    session.id_allocator,
+                )
+            }
+            Self::Mc6809(config) => {
+                let session = config
+                    .build_with_context(&emma09::device_registry(), context)
+                    .await
+                    .map_err(build_error)?;
+                (
+                    session.cpu.into(),
+                    session.error_receiver,
+                    session.id_allocator,
+                )
+            }
+        })
+    }
+}
+
 async fn load_session(profile_dir: &Path, log_sender: LogSender) -> Result<LoadedSession, String> {
     let config_path = profile_dir.join("emulator.toml");
-
-    let config: Config = Figment::new()
-        .merge(Toml::file(&config_path))
-        .merge(Env::prefixed("EMMA6K_").map(|k| k.as_str().replace('_', "-").into()))
-        .extract()
-        .map_err(|e| format!("Configuration error: {e}"))?;
+    let config = FamilyConfig::load(&config_path)?;
 
     // No `DeviceId` exists yet at this point (the console's isn't allocated until
     // `ConsoleModule::instantiate` runs deep inside `build_with_context` below), so the
@@ -262,7 +358,7 @@ async fn load_session(profile_dir: &Path, log_sender: LogSender) -> Result<Loade
     // instead of each independently-defaulted sender carrying its own always-zero counter (see
     // #372/#371).
     let context = InstantiationContext {
-        clock_hz: config.clock_speed_hz,
+        clock_hz: config.clock_speed_hz(),
         error_sender: None,
         console_transport: Some(transport_slot),
         keyboard_transport: Some(keyboard_transport_slot),
@@ -275,19 +371,17 @@ async fn load_session(profile_dir: &Path, log_sender: LogSender) -> Result<Loade
         lcd_display_geometry_sink: Some(lcd_display_geometry_slot.clone()),
     };
 
-    let registry = DeviceRegistry::with_builtins();
-    let mut session = config
-        .build_with_context(&registry, context)
-        .await
-        .map_err(|e| format!("Failed to build emulator session: {e}"))?;
-    session.cpu.set_log_sender(log_sender.clone());
+    let (mut cpu, error_receiver, mut id_allocator) = config.build(context).await?;
+    cpu.set_log_sender(log_sender.clone());
 
-    let device_id = session
-        .id_allocator
+    let session_error =
+        |e: emma65::emulator::BusConfigError| format!("Failed to build emulator session: {e}");
+    let ui_irq_source = id_allocator
         .for_irq(DEBUGGER_IRQ)
-        .map_err(|e| format!("Failed to build emulator session: {e}"))?;
-
-    let ui_irq_source = IrqSource::from(device_id);
+        .map(IrqSource::from)
+        .map_err(session_error)?;
+    let ui_firq_source =
+        cpu_bus::install_ui_firq_source(&mut cpu, &mut id_allocator).map_err(session_error)?;
     let display_geometry = display_geometry_slot
         .lock()
         .unwrap()
@@ -304,10 +398,12 @@ async fn load_session(profile_dir: &Path, log_sender: LogSender) -> Result<Loade
         .take()
         .map(lcd_display::LcdDisplayGeometryPayload::from);
     Ok(LoadedSession {
-        session,
+        cpu,
+        error_receiver,
         remote,
         kbd_remote,
         ui_irq_source,
+        ui_firq_source,
         display_frame_rx,
         display_geometry,
         led_matrix_frame_rx,
@@ -416,10 +512,12 @@ pub(crate) async fn load_or_reload_session(app: &AppHandle, profile_dir: &Path) 
 
     match load_session(profile_dir, log_sender.clone()).await {
         Ok(LoadedSession {
-            session,
+            mut cpu,
+            error_receiver,
             remote,
             kbd_remote,
             ui_irq_source,
+            ui_firq_source,
             display_frame_rx,
             display_geometry,
             led_matrix_frame_rx,
@@ -477,12 +575,9 @@ pub(crate) async fn load_or_reload_session(app: &AppHandle, profile_dir: &Path) 
             // with the CPU and every device (see `load_session`) so cycle counts on these events
             // aren't stuck at zero.
             tauri::async_runtime::spawn(emma65::emulator::log_device_events(
-                session.error_receiver,
+                error_receiver,
                 log_sender,
             ));
-
-            let mut cpu = session.cpu;
-            let variant = cpu.variant();
 
             if let Err(e) = cpu.reset() {
                 emit_status(
@@ -495,8 +590,8 @@ pub(crate) async fn load_or_reload_session(app: &AppHandle, profile_dir: &Path) 
                 return;
             }
 
-            let initial_pc = cpu.registers().pc;
-            let disasm = Disassembler::new(variant);
+            let initial_pc = cpu.pc();
+            let disasm = disassembly::DebugDisassembler::for_cpu(&cpu);
             *app.state::<disassembly::DisassemblerState>()
                 .0
                 .lock()
@@ -520,7 +615,11 @@ pub(crate) async fn load_or_reload_session(app: &AppHandle, profile_dir: &Path) 
             // reported inside the watchpoint panel, not via emit_status,
             // so it never blocks or fails the rest of the debugger.
             let symbol_table = cpu.bus().symbol_table().clone();
-            let watch_data = match watchpoints::load_watchpoints_from(profile_dir, &symbol_table) {
+            let watch_data = match watchpoints::load_watchpoints_from(
+                profile_dir,
+                &symbol_table,
+                cpu.watch_names(),
+            ) {
                 Ok((evaluator, enabled)) => watchpoints::WatchData {
                     evaluator,
                     compile_error: None,
@@ -571,7 +670,7 @@ pub(crate) async fn load_or_reload_session(app: &AppHandle, profile_dir: &Path) 
             // and reopened (issue #605). They each re-fetch their own `get_*_geometry` on this
             // broadcast instead. Its payload is the new session's CPU description, which the
             // panels that render registers, flags and interrupt controls follow.
-            let description = cpu::describe_6502(variant);
+            let description = cpu.description();
             *app.state::<cpu::CpuDescriptionState>().0.lock().unwrap() = Some(description.clone());
             let _ = app.emit("session-loaded", description);
 
@@ -596,6 +695,7 @@ pub(crate) async fn load_or_reload_session(app: &AppHandle, profile_dir: &Path) 
             *app.state::<cpu_bus::CpuBusCache>().0.lock().unwrap() =
                 cpu_bus::snapshot_cpu_bus(&cpu);
             *app.state::<cpu_bus::UiIrqSourceState>().0.lock().unwrap() = Some(ui_irq_source);
+            *app.state::<cpu_bus::UiFirqSourceState>().0.lock().unwrap() = ui_firq_source;
             *app.state::<CpuState>().0.lock().unwrap() = Some(cpu);
 
             emit_status(
@@ -819,6 +919,7 @@ pub fn run() {
         .manage(CpuState(Mutex::new(None)))
         .manage(cpu_bus::UiIrqSourceState(Mutex::new(None)))
         .manage(disassembly::DisassemblerState(Mutex::new(None)))
+        .manage(cpu_bus::UiFirqSourceState(Mutex::new(None)))
         .manage(registers::ChangedFlagsState(Mutex::new(0)))
         .manage(cpu::CpuDescriptionState(Mutex::new(None)))
         .manage(disassembly::RunStopperState(Mutex::new(None)))
@@ -837,6 +938,7 @@ pub fn run() {
         .manage(memory::MemoryViewSeq(AtomicU64::new(0)))
         .manage(cpu_bus::CpuBusCache(Mutex::new(cpu_bus::CpuBusSnapshot {
             irq_active: false,
+            firq_active: false,
             nmi_pending: false,
             cycles: 0,
             effective_speed: cpu_bus::EFFECTIVE_SPEED_UNKNOWN.to_string(),
@@ -1102,6 +1204,8 @@ pub fn run() {
             cpu_bus::trigger_nmi,
             cpu_bus::assert_irq,
             cpu_bus::release_irq,
+            cpu_bus::assert_firq,
+            cpu_bus::release_firq,
             registers::get_registers,
             cpu::get_cpu_description,
             disassembly::get_disassembly,
@@ -1256,4 +1360,82 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes `toml` as a profile's `emulator.toml` and loads it.
+    fn load(name: &str, toml: &str) -> Result<FamilyConfig, String> {
+        let dir = std::env::temp_dir().join(format!(
+            "emma6k-family-config-{name}-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("emulator.toml");
+        std::fs::write(&path, toml).unwrap();
+        let config = FamilyConfig::load(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        config
+    }
+
+    #[test]
+    fn a_profile_that_names_no_cpu_is_a_6502_profile() {
+        assert!(matches!(
+            load("none", "clock-speed-hz = 1000000\n"),
+            Ok(FamilyConfig::Mos6502(_))
+        ));
+    }
+
+    #[test]
+    fn a_profile_chooses_its_family_by_either_spelling() {
+        assert!(matches!(
+            load("cpu", "cpu = \"6809\"\n"),
+            Ok(FamilyConfig::Mc6809(_))
+        ));
+        assert!(matches!(
+            load("cpu-variant", "cpu-variant = 6809\n"),
+            Ok(FamilyConfig::Mc6809(_))
+        ));
+        assert!(matches!(
+            load("wdc", "cpu-variant = \"wdc65c02\"\n"),
+            Ok(FamilyConfig::Mos6502(_))
+        ));
+    }
+
+    #[test]
+    fn a_profile_with_an_unknown_cpu_or_both_spellings_fails_to_load() {
+        let err = load("z80", "cpu = \"z80\"\n").err().unwrap();
+        assert!(err.contains("'z80'"), "{err}");
+        let err = load("both", "cpu = \"6809\"\ncpu-variant = \"6809\"\n")
+            .err()
+            .unwrap();
+        assert!(err.contains("sets both"), "{err}");
+        let err = load("6309", "cpu = \"6309\"\n").err().unwrap();
+        assert!(err.contains("6309"), "{err}");
+    }
+
+    #[test]
+    fn every_bundled_template_loads_as_its_own_family() {
+        for family in emma6k::family::FAMILIES {
+            for template in family.templates() {
+                let dir = std::env::temp_dir().join(format!(
+                    "emma6k-family-template-{}-{:?}",
+                    template.id,
+                    std::thread::current().id()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let path = template.materialize(&dir).unwrap();
+                let config = FamilyConfig::load(&path);
+                let _ = std::fs::remove_dir_all(&dir);
+                let loaded = match config {
+                    Ok(FamilyConfig::Mos6502(_)) => Family::Mos6502,
+                    Ok(FamilyConfig::Mc6809(_)) => Family::Mc6809,
+                    Err(e) => panic!("{}: {e}", template.id),
+                };
+                assert_eq!(loaded, family, "{}", template.id);
+            }
+        }
+    }
 }

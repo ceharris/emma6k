@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use clap::Parser;
+use emma6k::family::{FAMILIES, find_template};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow, Wry};
 use tauri_plugin_dialog::DialogExt;
 
@@ -215,23 +216,30 @@ pub struct TemplateInfo {
     pub name: String,
     /// One-line description shown alongside `name` in the picker.
     pub description: String,
+    /// The CPU family the template runs, e.g. `"6502"` or `"6809"`, shown beside
+    /// `name` in the picker.
+    pub cpu: String,
 }
 
-/// Lists the bundled starter-profile templates available to New Profile.
+/// Lists every family's bundled starter-profile templates, for New Profile, in the
+/// order `emma6k` lists them: the 6502's, then the 6809's.
 #[tauri::command]
 pub fn list_templates() -> Vec<TemplateInfo> {
-    emma65::emulator::config::templates::TEMPLATES
+    FAMILIES
         .iter()
-        .map(|t| TemplateInfo {
-            id: t.id.to_string(),
-            name: t.name.to_string(),
-            description: t.description.to_string(),
+        .flat_map(|&family| {
+            family.templates().iter().map(move |t| TemplateInfo {
+                id: t.id.to_string(),
+                name: t.name.to_string(),
+                description: t.description.to_string(),
+                cpu: family.to_string(),
+            })
         })
         .collect()
 }
 
 /// Creates a not-yet-existing profile directory named `name`, seeded from
-/// starter template `template_id` (see [`emma65::emulator::config::templates`])
+/// starter template `template_id`, of any family (see [`list_templates`])
 /// rather than always cloning the `default` profile. Used only by
 /// [`create_profile`] — the `--profile <name>`-at-startup path still goes
 /// through [`ensure_profile_dir`], which is unaffected by this function and
@@ -240,7 +248,9 @@ fn create_profile_dir_from_template(name: &str, template_id: &str) -> Result<Pat
     let dir = profile_dir(name)?;
     fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create profile directory {}: {e}", dir.display()))?;
-    emma65::emulator::config::templates::materialize(template_id, &dir)
+    let (_, template) = find_template(template_id)?;
+    template
+        .materialize(&dir)
         .map_err(|e| format!("Failed to seed profile from template '{template_id}': {e}"))?;
     Ok(dir)
 }
@@ -533,6 +543,24 @@ mod tests {
                 .iter()
                 .all(|t| !t.name.is_empty() && !t.description.is_empty())
         );
+        let cpu_of = |id| &templates.iter().find(|t| t.id == id).unwrap().cpu;
+        assert_eq!(cpu_of("taliforth"), "6502");
+        assert_eq!(cpu_of("camelforth"), "6809");
+    }
+
+    #[test]
+    fn create_profile_dir_from_template_seeds_from_a_6809_template() {
+        let _guard = HOME_ENV_LOCK.lock().unwrap();
+        let home = temp_home("create-from-camelforth-template");
+        // SAFETY: HOME_ENV_LOCK excludes every other test using it, across modules.
+        unsafe { std::env::set_var("HOME", &home) };
+
+        let dir = create_profile_dir_from_template("forth09", "camelforth").unwrap();
+
+        let toml = fs::read_to_string(dir.join("emulator.toml")).unwrap();
+        assert!(toml.contains("6809"), "{toml}");
+        assert!(dir.join("program.bin").exists());
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

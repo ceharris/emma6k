@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { useCpuDescription } from "./CpuDescriptionContext";
+import { formatInstructionBytes, instructionBytesWidth } from "./cpuDescription";
 import { useExecutionContext } from "./ExecutionContext";
 import { useRunControlsContext } from "./RunControlsContext";
 import type { RegisterSnapshot } from "./RegisterPanel";
@@ -283,11 +285,11 @@ export default function DisassemblyPanel() {
 
   const formatAddr = (addr: number) => addr.toString(16).toUpperCase().padStart(4, "0");
 
-  const formatBytes = (bytes: string[]) =>
-    bytes
-      .map((b) => b.padStart(2, "0"))
-      .join(" ")
-      .padEnd(8, " ");
+  // The bytes column fits the CPU's longest instruction: three bytes on the 6502, five
+  // on the 6809.
+  const maxInstructionLen = useCpuDescription()?.max_instruction_len ?? 3;
+  const formatBytes = (bytes: string[]) => formatInstructionBytes(bytes, maxInstructionLen);
+  const bytesColumnStyle = { flexBasis: `${instructionBytesWidth(maxInstructionLen) + 1}ch` };
 
   return (
     <div className="disassembly-panel">
@@ -373,7 +375,9 @@ export default function DisassemblyPanel() {
                   {gutterDot}
                 </span>
                 <span className="disasm-addr">{formatAddr(row.addr)}</span>
-                <span className="disasm-bytes">{formatBytes(row.bytes)}</span>
+                <span className="disasm-bytes" style={bytesColumnStyle}>
+                  {formatBytes(row.bytes)}
+                </span>
                 <span className="disasm-mnemonic">{row.mnemonic}</span>
                 {row.operand && <span className="disasm-operand">{row.operand}</span>}
                 {row.comment && <span className="disasm-comment">{row.comment}</span>}

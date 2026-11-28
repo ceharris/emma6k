@@ -5,6 +5,7 @@ import { ExecState } from "./RunControlsContext";
 import { useCpuDescription } from "./CpuDescriptionContext";
 import { useExecutionContext } from "./ExecutionContext";
 import type { RegisterSnapshot } from "./RegisterPanel";
+import { stoppedLabel, waitingLabel } from "./statusLabels";
 import "./styles/status-bar.scss";
 
 /** Minimum time in ms that the Step indicator remains visible so users can perceive it. */
@@ -12,6 +13,8 @@ const STEP_INDICATOR_MIN_MS = 75;
 
 interface CpuBusState {
   irq_active: boolean;
+  /** True while any source routed to FIRQ asserts it (always false on a CPU without FIRQ). */
+  firq_active: boolean;
   nmi_pending: boolean;
   cycles: number;
   effective_speed: string;
@@ -20,11 +23,6 @@ interface CpuBusState {
   cpu_waiting: boolean;
   /** The status the program asked to exit with through the `exit` device, once stopped for it. */
   exit_status: number | null;
-}
-
-/** The stopped CPU's indicator label: the exit status if the program exited, else STP. */
-export function stoppedLabel(exitStatus: number | null | undefined): string {
-  return exitStatus == null ? "STP Executed" : `Exit ${exitStatus}`;
 }
 
 /** Splits "1.8432 MHz" into ["1.8432", "MHz"] so the value and unit can be styled separately. */
@@ -48,13 +46,23 @@ export function formatCycles(n: number): string {
 export default function StatusBar() {
   const { execState, onReset } = useExecutionContext();
   // The interrupt controls shown are the CPU's interrupt lines.
-  const interruptLines = useCpuDescription()?.interrupt_lines ?? [];
+  const description = useCpuDescription();
+  const family = description?.family;
+  const interruptLines = description?.interrupt_lines ?? [];
   const hasNmi = interruptLines.includes("NMI");
   const hasIrq = interruptLines.includes("IRQ");
+  const hasFirq = interruptLines.includes("FIRQ");
   const [cpuBus, setCpuBus] = useState<CpuBusState | null>(null);
-  // Local toggle state for the IRQ control, independent of the aggregate
-  // cpuBus.irq_active indicator (which reflects all IRQ sources, including devices).
+  // Local toggle state for the IRQ and FIRQ controls, independent of the aggregate
+  // cpuBus.irq_active/firq_active indicators (which reflect every source, including devices).
   const [irqAsserted, setIrqAsserted] = useState(false);
+  const [firqAsserted, setFirqAsserted] = useState(false);
+
+  // A new session starts with neither UI line asserted.
+  useEffect(() => {
+    setIrqAsserted(false);
+    setFirqAsserted(false);
+  }, [description]);
 
   // Display state for the Run/Stop/Step indicator. When stepping, hold the
   // "stepping" state for at least STEP_INDICATOR_MIN_MS so the transition is
@@ -148,6 +156,7 @@ export default function StatusBar() {
       // and the register update instead arrives via the debugger-run-stopped event.
       const snap = await invoke<RegisterSnapshot | null>("reset_cpu");
       setIrqAsserted(false);
+      setFirqAsserted(false);
       if (snap !== null) {
         onReset(snap);
       }
@@ -165,25 +174,36 @@ export default function StatusBar() {
     }
   }, []);
 
-  const handleToggleIrq = useCallback(async () => {
-    try {
-      // While free-running (or step-over/step-return in progress), the backend
-      // treats assert_irq as a one-shot pulse that auto-releases once the CPU
-      // services it (see #261) — so there's no sticky "asserted" state to track
-      // here, and the control behaves like the momentary NMI trigger instead of
-      // a toggle.
-      if (cpuBus?.is_running) {
-        const result = await invoke<CpuBusState>("assert_irq");
-        setCpuBus(result);
-        return;
+  /**
+   * Toggles one of the UI's own interrupt lines (`irq` or `firq`): assert or release
+   * while halted or stepping. While free-running (or step-over/step-return in progress),
+   * the backend treats assert as a one-shot pulse that auto-releases once the CPU
+   * services it (see #261) — so there's no sticky "asserted" state to track then, and
+   * the control behaves like the momentary NMI trigger instead of a toggle.
+   */
+  const toggleLine = useCallback(
+    async (line: "irq" | "firq", asserted: boolean, setAsserted: (v: boolean) => void) => {
+      try {
+        if (cpuBus?.is_running) {
+          setCpuBus(await invoke<CpuBusState>(`assert_${line}`));
+          return;
+        }
+        setCpuBus(await invoke<CpuBusState>(asserted ? `release_${line}` : `assert_${line}`));
+        setAsserted(!asserted);
+      } catch (e) {
+        console.error(`assert_${line}/release_${line} failed:`, e);
       }
-      const result = await invoke<CpuBusState>(irqAsserted ? "release_irq" : "assert_irq");
-      setCpuBus(result);
-      setIrqAsserted((prev) => !prev);
-    } catch (e) {
-      console.error("assert_irq/release_irq failed:", e);
-    }
-  }, [irqAsserted, cpuBus?.is_running]);
+    },
+    [cpuBus?.is_running],
+  );
+  const handleToggleIrq = useCallback(
+    () => toggleLine("irq", irqAsserted, setIrqAsserted),
+    [toggleLine, irqAsserted],
+  );
+  const handleToggleFirq = useCallback(
+    () => toggleLine("firq", firqAsserted, setFirqAsserted),
+    [toggleLine, firqAsserted],
+  );
 
   // Determine Run/Stop/Step/STP/WAI indicator label and color class.
   // STP and WAI override the normal "Stop" state when the CPU has halted
@@ -196,10 +216,10 @@ export default function StatusBar() {
   let runStopClass: string;
   if (displayExecState === "running") {
     if (cpuBus?.cpu_stopped) {
-      runStopLabel = stoppedLabel(cpuBus.exit_status);
+      runStopLabel = stoppedLabel(cpuBus.exit_status, family);
       runStopClass = "indicator-stp";
     } else if (cpuBus?.cpu_waiting) {
-      runStopLabel = "WAI Executed";
+      runStopLabel = waitingLabel(family);
       runStopClass = "indicator-wai";
     } else {
       runStopLabel = "Run";
@@ -209,10 +229,10 @@ export default function StatusBar() {
     runStopLabel = "Stop";
     runStopClass = "indicator-step";
   } else if (cpuBus?.cpu_stopped) {
-    runStopLabel = stoppedLabel(cpuBus.exit_status);
+    runStopLabel = stoppedLabel(cpuBus.exit_status, family);
     runStopClass = "indicator-stp";
   } else if (cpuBus?.cpu_waiting) {
-    runStopLabel = "WAI Executed";
+    runStopLabel = waitingLabel(family);
     runStopClass = "indicator-wai";
   } else {
     runStopLabel = "Stop";
@@ -259,6 +279,22 @@ export default function StatusBar() {
             ●
           </span>
           <span className="status-bar-label">IRQ</span>
+        </button>
+      )}
+      {hasFirq && (
+        <button
+          className={`status-bar-cell status-bar-toggle${firqAsserted ? " active" : ""}`}
+          onClick={handleToggleFirq}
+          title={
+            cpuBus?.is_running ? "Trigger FIRQ (one-shot while running)" : "Assert/Release FIRQ"
+          }
+        >
+          <span
+            className={`indicator ${cpuBus?.firq_active ? "indicator-irq-active" : "indicator-idle"}`}
+          >
+            ●
+          </span>
+          <span className="status-bar-label">FIRQ</span>
         </button>
       )}
       <div className="status-bar-cell status-bar-run">

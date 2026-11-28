@@ -11,6 +11,8 @@ interface TemplateInfo {
   name: string;
   /** One-line description shown alongside `name` in the picker. */
   description: string;
+  /** The CPU family the template runs, e.g. "6502" or "6809", shown beside `name`. */
+  cpu: string;
 }
 
 /** State for the New Profile dialog; null means closed. */
@@ -145,7 +147,10 @@ export default function NewProfileDialog() {
                   onChange={() => setDialog((d) => d && { ...d, templateId: t.id })}
                 />
                 <div className="modal-template-text">
-                  <span className="modal-template-name">{t.name}</span>
+                  <span className="modal-template-name">
+                    {t.name}
+                    <span className="modal-template-cpu">{t.cpu}</span>
+                  </span>
                   <span className="modal-template-desc">{t.description}</span>
                 </div>
               </label>

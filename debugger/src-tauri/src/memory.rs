@@ -5,9 +5,8 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 use tauri::{AppHandle, Emitter, State};
 
-use emma65::emulator::Cpu;
-
 use crate::CpuState;
+use crate::cpu::DebugCpu;
 use crate::disassembly::LiveSnapshotRx;
 
 /// Paragraph-aligned address of the memory page currently displayed in the
@@ -71,13 +70,7 @@ pub fn get_memory(
             .map_err(|e| e.to_string())?;
         return Ok(buf);
     }
-    let live = live_snapshot_rx
-        .0
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|rx| rx.borrow().clone())
-        .ok_or("CPU not ready")?;
+    let live = live_snapshot_rx.latest().ok_or("CPU not ready")?;
     Ok(live.memory_page)
 }
 
@@ -109,7 +102,7 @@ pub fn write_memory(
                 bus.write(a, byte).map_err(|e| e.to_string())?;
             }
         }
-        cpu.registers().pc
+        cpu.pc()
     };
     app.emit("debugger-halted", pc).ok();
     app.emit("memory-modified", ()).ok();
@@ -126,7 +119,7 @@ pub fn write_memory(
 /// files, the assembler, or user-defined symbols — untouched. Returns the CPU's program
 /// counter on success.
 fn apply_loaded_memory(
-    cpu: &mut Cpu,
+    cpu: &mut DebugCpu,
     data: &[u8],
     load_format: emma65::emulator::config::loader::LoadFormat,
     bias: u16,
@@ -136,7 +129,7 @@ fn apply_loaded_memory(
     use emma65::emulator::bus::BusLoadTarget;
     use emma65::emulator::config::loader::load_target;
 
-    let pc = cpu.registers().pc;
+    let pc = cpu.pc();
     let bus = cpu.bus_mut();
     let mut target = BusLoadTarget::new(bus, bias as usize);
     load_target(data, load_format, &mut target).map_err(|e| e.to_string())?;
@@ -245,7 +238,7 @@ pub fn fill_memory(
     let pc = {
         let mut guard = cpu_state.0.lock().unwrap();
         let cpu = guard.as_mut().ok_or("CPU not ready")?;
-        let pc = cpu.registers().pc;
+        let pc = cpu.pc();
         let bus = cpu.bus_mut();
         let mut addr = start;
         loop {
@@ -296,6 +289,7 @@ pub fn get_symbols_for_range(
 mod tests {
     use super::*;
     use crate::CpuState;
+    use crate::disassembly::DebugProcessor;
     use emma65::emulator::{
         AddressRange, Bus, ClockSpeed, Cpu, CpuBuilder, CpuVariant, run_from as exec_run_from,
     };
@@ -303,7 +297,7 @@ mod tests {
     use tauri::Manager;
     use tauri::test::{mock_builder, mock_context, noop_assets};
 
-    fn make_cpu() -> Cpu {
+    fn make_6502() -> Cpu {
         let mut bus = Bus::config()
             .ram_with_fill(AddressRange::new(0x0000, 0xFFFF), 0)
             .unwrap()
@@ -317,6 +311,10 @@ mod tests {
             .unwrap();
         cpu.reset().unwrap();
         cpu
+    }
+
+    fn make_cpu() -> DebugCpu {
+        make_6502().into()
     }
 
     /// Reproduces issue #453 (navigate to a page while stopped, then Run): the page
@@ -352,10 +350,13 @@ mod tests {
 
         // Run: mirrors run_cpu's core logic (take the CPU, start the run loop,
         // subscribe the live snapshot channel).
-        let cpu = app.state::<CpuState>().0.lock().unwrap().take().unwrap();
+        let Some(DebugCpu::Mos6502(cpu)) = app.state::<CpuState>().0.lock().unwrap().take() else {
+            panic!("a 6502 test CPU");
+        };
         let mem_view_addr = Arc::clone(&app.state::<MemoryViewAddr>().0);
         let handle = exec_run_from(cpu, None, Arc::clone(&mem_view_addr), Vec::new(), true);
-        *app.state::<LiveSnapshotRx>().0.lock().unwrap() = Some(handle.subscribe_live());
+        *app.state::<LiveSnapshotRx>().0.lock().unwrap() =
+            Some(Cpu::live_rx(handle.subscribe_live()));
 
         // A handful of debugger-running-tick refreshes (100ms apart) re-requesting
         // the same page; every one must still see 0xC000's content, not 0x0000's.

@@ -2,8 +2,11 @@ import { render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CpuDescriptionProvider } from "./CpuDescriptionContext";
 import { ExecutionProvider } from "./ExecutionContext";
-import StatusBar, { formatCycles, splitSpeed, stoppedLabel } from "./StatusBar";
-import { DESCRIPTION_6502 } from "./test/cpuFixtures";
+import { fireEvent, waitFor } from "@testing-library/react";
+import StatusBar, { formatCycles, splitSpeed } from "./StatusBar";
+import { stoppedLabel, waitingLabel } from "./statusLabels";
+import { DESCRIPTION_6502, DESCRIPTION_6809 } from "./test/cpuFixtures";
+import type { CpuDescription } from "./cpuDescription";
 import { invoke, resetTauriMocks } from "./test/tauriMock";
 
 describe("splitSpeed", () => {
@@ -43,11 +46,24 @@ describe("stoppedLabel", () => {
   it("shows the exit status when the program exited", () => {
     expect(stoppedLabel(0)).toBe("Exit 0");
     expect(stoppedLabel(42)).toBe("Exit 42");
+    expect(stoppedLabel(3, "6809")).toBe("Exit 3");
+  });
+
+  it("names no STP on the 6809, which has none", () => {
+    expect(stoppedLabel(null, "6809")).toBe("Stopped");
+  });
+});
+
+describe("waitingLabel", () => {
+  it("names WAI on the 6502 and just waiting on the 6809 (CWAI or SYNC)", () => {
+    expect(waitingLabel("6502")).toBe("WAI Executed");
+    expect(waitingLabel("6809")).toBe("Waiting");
   });
 });
 
 const CPU_BUS_STATE = {
   irq_active: false,
+  firq_active: false,
   nmi_pending: false,
   cycles: 0,
   effective_speed: "1.8432 MHz",
@@ -63,11 +79,15 @@ describe("StatusBar interrupt controls", () => {
   });
 
   function renderWithLines(interruptLines: string[]) {
+    renderWith({ ...DESCRIPTION_6502, interrupt_lines: interruptLines });
+  }
+
+  function renderWith(description: CpuDescription) {
     vi.mocked(invoke).mockImplementation(async (cmd) => {
-      if (cmd === "get_cpu_description") {
-        return { ...DESCRIPTION_6502, interrupt_lines: interruptLines };
-      }
+      if (cmd === "get_cpu_description") return description;
       if (cmd === "get_cpu_bus_state") return CPU_BUS_STATE;
+      if (cmd === "assert_firq") return { ...CPU_BUS_STATE, firq_active: true };
+      if (cmd === "release_firq") return CPU_BUS_STATE;
       return undefined;
     });
     render(
@@ -91,5 +111,29 @@ describe("StatusBar interrupt controls", () => {
 
     expect(await screen.findByTitle("Assert/Release IRQ")).toBeInTheDocument();
     expect(screen.queryByTitle("Trigger NMI")).not.toBeInTheDocument();
+  });
+
+  it("leaves out FIRQ on the 6502", async () => {
+    renderWithLines(DESCRIPTION_6502.interrupt_lines);
+
+    expect(await screen.findByTitle("Assert/Release IRQ")).toBeInTheDocument();
+    expect(screen.queryByTitle("Assert/Release FIRQ")).not.toBeInTheDocument();
+  });
+
+  it("asserts and releases FIRQ on the 6809", async () => {
+    renderWith(DESCRIPTION_6809);
+
+    const firq = await screen.findByTitle("Assert/Release FIRQ");
+    expect(screen.getByTitle("Trigger NMI")).toBeInTheDocument();
+    expect(screen.getByTitle("Assert/Release IRQ")).toBeInTheDocument();
+
+    fireEvent.click(firq);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("assert_firq"));
+    await waitFor(() => expect(firq).toHaveClass("active"));
+    expect(firq.querySelector(".indicator")).toHaveClass("indicator-irq-active");
+
+    fireEvent.click(firq);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("release_firq"));
+    await waitFor(() => expect(firq).not.toHaveClass("active"));
   });
 });
