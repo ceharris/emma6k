@@ -23,6 +23,9 @@ export interface FlagDescription {
   name: string;
 }
 
+/** The order of a word's bytes in memory. */
+export type ByteOrder = "little" | "big";
+
 /** What the session's CPU looks like, as the backend describes it. */
 export interface CpuDescription {
   family: string;
@@ -34,7 +37,7 @@ export interface CpuDescription {
   flags_register: string;
   interrupt_lines: string[];
   stack: { pointer: string; page_fixed: boolean };
-  byte_order: "little" | "big";
+  byte_order: ByteOrder;
   max_instruction_len: number;
   assembler: boolean;
 }
@@ -47,4 +50,16 @@ export function isUnusedFlag(flag: FlagDescription): boolean {
 /** The bitmask of `flag` within the flags register. */
 export function flagMask(flag: FlagDescription): number {
   return 1 << flag.bit;
+}
+
+/**
+ * Splits `value` into `sizeBytes` bytes for `write_memory`, in address order: least
+ * significant first for a `little` CPU (the 6502), most significant first for a `big` one.
+ */
+export function toBytes(value: number, sizeBytes: number, order: ByteOrder): number[] {
+  const bytes: number[] = [];
+  for (let i = 0; i < sizeBytes; i++) {
+    bytes.push((value >>> (i * 8)) & 0xff);
+  }
+  return order === "big" ? bytes.reverse() : bytes;
 }

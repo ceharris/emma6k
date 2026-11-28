@@ -14,7 +14,7 @@ React/TypeScript frontend (`debugger/frontend/`) via `#[tauri::command]`s. UI pr
 - **`cpu_bus`** — reset, IRQ assert/release, NMI trigger, cached bus-signal snapshot
 - **`disassembly`** — run/stop/step-into/step-over/step-return, breakpoint CRUD, disassembly listing
 - **`memory`** — paged reads/writes/fills/file loads
-- **`stack`** — stack pointer and stack page snapshot
+- **`stack`** — stack pointer, top, and the CPU's stack window (`Processor::stack_window`), with full addresses
 - **`terminal`** — console byte-stream bridge and window visibility (toggleable window)
 - **`trace`** — live-recorded execution trace, windowed reads
 - **`watchpoints`** — loads/compiles `watchpoints.emw`, evaluates on demand, add/remove/edit/toggle with persistence

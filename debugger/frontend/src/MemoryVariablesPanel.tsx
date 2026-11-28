@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { useCpuDescription } from "./CpuDescriptionContext";
+import { toBytes } from "./cpuDescription";
 import { useExecutionContext } from "./ExecutionContext";
 import { formatDataRadix } from "./RadixControl";
 import { usePanelHeaderAction } from "./layout/panelHeaderActions";
@@ -193,15 +195,6 @@ function toUnsignedInRangeWide(value: number, widthBits: number): number | null 
   const min = -(range / 2);
   if (value < min || value > max) return null;
   return value >= 0 ? value : value + range;
-}
-
-/** Splits `value` into `sizeBytes` little-endian bytes for `write_memory`. */
-function toLittleEndianBytes(value: number, sizeBytes: number): number[] {
-  const bytes: number[] = [];
-  for (let i = 0; i < sizeBytes; i++) {
-    bytes.push((value >>> (i * 8)) & 0xff);
-  }
-  return bytes;
 }
 
 /**
@@ -425,6 +418,8 @@ function NameAutocomplete({
 
 export default function MemoryVariablesPanel() {
   const { execState } = useExecutionContext();
+  // The backend reads values in the CPU's byte order; edits write them back in it.
+  const byteOrder = useCpuDescription()?.byte_order ?? "little";
   const panelRef = useRef<HTMLDivElement>(null);
   const [rows, setRows] = useState<MemoryVariableRow[] | null>(null);
   const [selectedName, setSelectedName] = useState<string | null>(null);
@@ -573,21 +568,24 @@ export default function MemoryVariablesPanel() {
    * via the listener already installed above, so no local row update is
    * needed here on success.
    */
-  const commitValueEdit = useCallback(async (row: MemoryVariableRow, value: number) => {
-    if (row.address === null) return;
-    try {
-      await invoke("write_memory", {
-        addr: row.address,
-        data: toLittleEndianBytes(value, TYPE_WIDTH_BITS[row.data_type] / 8),
-        patch: false,
-      });
-      setEditingValueName(null);
-      setValueEditInvalid(false);
-    } catch (e) {
-      console.error("write_memory failed:", e);
-      setValueEditInvalid(true);
-    }
-  }, []);
+  const commitValueEdit = useCallback(
+    async (row: MemoryVariableRow, value: number) => {
+      if (row.address === null) return;
+      try {
+        await invoke("write_memory", {
+          addr: row.address,
+          data: toBytes(value, TYPE_WIDTH_BITS[row.data_type] / 8, byteOrder),
+          patch: false,
+        });
+        setEditingValueName(null);
+        setValueEditInvalid(false);
+      } catch (e) {
+        console.error("write_memory failed:", e);
+        setValueEditInvalid(true);
+      }
+    },
+    [byteOrder],
+  );
 
   /** A `bool` row's checkbox commits immediately on toggle — no separate text-parse step. */
   const commitBoolValueEdit = useCallback(
