@@ -12,9 +12,10 @@ use std::sync::Mutex;
 
 use emma65::emulator::{Bus, SymbolSource, SymbolTable};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::CpuState;
+use crate::cpu::{ByteOrder, CpuDescriptionState};
 use crate::disassembly::LiveSnapshotRx;
 use crate::profile::ProfileDirState;
 use crate::symbols::format_source;
@@ -198,31 +199,53 @@ pub struct MemoryVariableRow {
     pub value: Option<i64>,
 }
 
+/// The byte order memory variables are read in: the session CPU's, from its
+/// description. Before a session loads there is nothing to read, and the 6502's
+/// little-endian order stands in.
+fn byte_order(description_state: &CpuDescriptionState) -> ByteOrder {
+    description_state
+        .0
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(ByteOrder::Little, |d| d.byte_order)
+}
+
 /// Reads `data_type.size_bytes()` bytes starting at `addr` via `read_byte`
-/// (side-effect-free) and assembles them little-endian into a raw unsigned
-/// value — the same wrapping-address, little-endian convention
-/// `watch::context`'s `FetchWord`/`FetchDWord` and `Cpu::read_mem_u32`
-/// already establish for this codebase. Never sign-extends: signedness is a
+/// (side-effect-free) and assembles them in `order` into a raw unsigned
+/// value — the same wrapping-address convention `watch::context`'s
+/// `FetchWord`/`FetchDWord` and each CPU's `read_mem_u32` use, in the
+/// CPU's own byte order. Never sign-extends: signedness is a
 /// `Radix` display concern, applied later by the frontend, not a storage
 /// concern here.
 ///
 /// Takes a byte-reader closure rather than a `&Bus` directly so the same
 /// logic serves both a halted CPU's bus (`resolve_row`) and a free-running
 /// live snapshot's flat memory buffer (`resolve_row_from_snapshot`).
-fn read_value(mut read_byte: impl FnMut(u16) -> u8, addr: u16, data_type: VariableType) -> i64 {
+fn read_value(
+    mut read_byte: impl FnMut(u16) -> u8,
+    addr: u16,
+    data_type: VariableType,
+    order: ByteOrder,
+) -> i64 {
     let width = data_type.size_bytes() as u16;
-    let mut raw: u32 = 0;
-    for i in 0..width {
-        raw |= (read_byte(addr.wrapping_add(i)) as u32) << (i * 8);
-    }
-    raw as i64
+    let bytes: Vec<u8> = (0..width)
+        .map(|i| read_byte(addr.wrapping_add(i)))
+        .collect();
+    i64::from(order.assemble(bytes.into_iter()))
 }
 
 /// Resolves `def` against the live symbol table and memory into a display row.
-fn resolve_row(def: &VariableDef, table: &SymbolTable, bus: &Bus) -> MemoryVariableRow {
+fn resolve_row(
+    def: &VariableDef,
+    table: &SymbolTable,
+    bus: &Bus,
+    order: ByteOrder,
+) -> MemoryVariableRow {
     let address = table.address_for(&def.name);
     let source = address.and_then(|_| table.source_for(&def.name).map(|s| format_source(s).0));
-    let value = address.map(|addr| read_value(|a| bus.peek(a).unwrap_or(0), addr, def.data_type));
+    let value =
+        address.map(|addr| read_value(|a| bus.peek(a).unwrap_or(0), addr, def.data_type, order));
     MemoryVariableRow {
         name: def.name.clone(),
         data_type: def.data_type,
@@ -234,10 +257,14 @@ fn resolve_row(def: &VariableDef, table: &SymbolTable, bus: &Bus) -> MemoryVaria
 }
 
 /// Builds a fresh row list for every definition in `defs`, resolved against `cpu`.
-fn resolve_rows(defs: &[VariableDef], cpu: &emma65::emulator::Cpu) -> Vec<MemoryVariableRow> {
+fn resolve_rows(
+    defs: &[VariableDef],
+    cpu: &emma65::emulator::Cpu,
+    order: ByteOrder,
+) -> Vec<MemoryVariableRow> {
     let table = cpu.bus().symbol_table();
     defs.iter()
-        .map(|def| resolve_row(def, table, cpu.bus()))
+        .map(|def| resolve_row(def, table, cpu.bus(), order))
         .collect()
 }
 
@@ -255,8 +282,16 @@ fn resolve_row_from_snapshot(
     def: &VariableDef,
     addr: Option<u16>,
     bytes: &HashMap<u16, u8>,
+    order: ByteOrder,
 ) -> MemoryVariableRow {
-    let value = addr.map(|a| read_value(|b| bytes.get(&b).copied().unwrap_or(0), a, def.data_type));
+    let value = addr.map(|a| {
+        read_value(
+            |b| bytes.get(&b).copied().unwrap_or(0),
+            a,
+            def.data_type,
+            order,
+        )
+    });
     MemoryVariableRow {
         name: def.name.clone(),
         data_type: def.data_type,
@@ -398,10 +433,11 @@ fn resolve_rows_current(
     cpu_state: &CpuState,
     live_snapshot_rx: &LiveSnapshotRx,
     resolved_addr_cache: &ResolvedAddrCache,
+    order: ByteOrder,
 ) -> Vec<MemoryVariableRow> {
     let cpu_guard = cpu_state.0.lock().unwrap();
     if let Some(cpu) = cpu_guard.as_ref() {
-        let rows = resolve_rows(defs, cpu);
+        let rows = resolve_rows(defs, cpu, order);
         cache_resolved_addrs(&rows, &resolved_addr_cache.0);
         return rows;
     }
@@ -419,7 +455,7 @@ fn resolve_rows_current(
             defs.iter()
                 .map(|def| {
                     let addr = cache.get(&def.name).copied().flatten();
-                    resolve_row_from_snapshot(def, addr, &bytes)
+                    resolve_row_from_snapshot(def, addr, &bytes, order)
                 })
                 .collect()
         }
@@ -441,6 +477,7 @@ fn resolve_rows_current(
 #[tauri::command]
 pub fn get_memory_variables(
     cpu_state: State<CpuState>,
+    description_state: State<CpuDescriptionState>,
     memory_variables_state: State<MemoryVariablesState>,
     live_snapshot_rx: State<LiveSnapshotRx>,
     resolved_addr_cache: State<ResolvedAddrCache>,
@@ -451,6 +488,7 @@ pub fn get_memory_variables(
         &cpu_state,
         &live_snapshot_rx,
         &resolved_addr_cache,
+        byte_order(&description_state),
     ))
 }
 
@@ -492,7 +530,7 @@ pub fn add_memory_variable(
         fields.radix,
     )?;
     save_memory_variables_to(&profile_dir.0.lock().unwrap().clone(), &defs)?;
-    let rows = resolve_rows(&defs, cpu);
+    let rows = resolve_rows(&defs, cpu, byte_order(&app.state::<CpuDescriptionState>()));
     cache_resolved_addrs(&rows, &resolved_addr_cache.0);
     app.emit("memory-variables-changed", ()).ok();
     if inserted_symbol {
@@ -527,7 +565,7 @@ pub fn edit_memory_variable(
         fields.radix,
     )?;
     save_memory_variables_to(&profile_dir.0.lock().unwrap().clone(), &defs)?;
-    let rows = resolve_rows(&defs, cpu);
+    let rows = resolve_rows(&defs, cpu, byte_order(&app.state::<CpuDescriptionState>()));
     cache_resolved_addrs(&rows, &resolved_addr_cache.0);
     app.emit("memory-variables-changed", ()).ok();
     if renamed {
@@ -570,7 +608,13 @@ pub fn set_memory_variable_radix(
     let mut defs = memory_variables_state.0.lock().unwrap();
     set_variable_radix(&mut defs, &change.name, change.radix)?;
     save_memory_variables_to(&profile_dir.0.lock().unwrap().clone(), &defs)?;
-    let rows = resolve_rows_current(&defs, &cpu_state, &live_snapshot_rx, &resolved_addr_cache);
+    let rows = resolve_rows_current(
+        &defs,
+        &cpu_state,
+        &live_snapshot_rx,
+        &resolved_addr_cache,
+        byte_order(&app.state::<CpuDescriptionState>()),
+    );
     app.emit("memory-variables-changed", ()).ok();
     Ok(rows)
 }
@@ -591,7 +635,7 @@ pub fn remove_memory_variable(
     save_memory_variables_to(&profile_dir.0.lock().unwrap().clone(), &defs)?;
     let cpu_guard = cpu_state.0.lock().unwrap();
     let rows = match cpu_guard.as_ref() {
-        Some(cpu) => resolve_rows(&defs, cpu),
+        Some(cpu) => resolve_rows(&defs, cpu, byte_order(&app.state::<CpuDescriptionState>())),
         None => Vec::new(),
     };
     cache_resolved_addrs(&rows, &resolved_addr_cache.0);
@@ -751,9 +795,60 @@ mod tests {
         bus.write(0x0200, 0x34).unwrap();
         bus.write(0x0201, 0x12).unwrap();
         assert_eq!(
-            read_value(|a| bus.peek(a).unwrap_or(0), 0x0200, VariableType::Word),
+            read_value(
+                |a| bus.peek(a).unwrap_or(0),
+                0x0200,
+                VariableType::Word,
+                ByteOrder::Little
+            ),
             0x1234
         );
+    }
+
+    #[test]
+    fn read_value_reads_big_endian_in_a_big_endian_order() {
+        let mut bus = make_bus();
+        for (i, byte) in [0x12, 0x34, 0x56, 0x78].into_iter().enumerate() {
+            bus.write(0x0200 + i as u16, byte).unwrap();
+        }
+        let read = |data_type| {
+            read_value(
+                |a| bus.peek(a).unwrap_or(0),
+                0x0200,
+                data_type,
+                ByteOrder::Big,
+            )
+        };
+        assert_eq!(read(VariableType::Byte), 0x12);
+        assert_eq!(read(VariableType::Word), 0x1234);
+        assert_eq!(read(VariableType::DWord), 0x1234_5678);
+    }
+
+    #[test]
+    fn read_value_wraps_at_the_top_of_memory_in_either_order() {
+        let mut bus = make_bus();
+        bus.write(0xFFFF, 0x12).unwrap();
+        bus.write(0x0000, 0x34).unwrap();
+        let read = |order| {
+            read_value(
+                |a| bus.peek(a).unwrap_or(0),
+                0xFFFF,
+                VariableType::Word,
+                order,
+            )
+        };
+        assert_eq!(read(ByteOrder::Little), 0x3412);
+        assert_eq!(read(ByteOrder::Big), 0x1234);
+    }
+
+    #[test]
+    fn the_byte_order_comes_from_the_description_and_is_little_before_a_session() {
+        let state = CpuDescriptionState(Mutex::new(None));
+        assert_eq!(byte_order(&state), ByteOrder::Little);
+        let mut description = crate::cpu::describe_6502(emma65::emulator::CpuVariant::Wdc65C02);
+        description.byte_order = ByteOrder::Big;
+        *state.0.lock().unwrap() = Some(description);
+        assert_eq!(byte_order(&state), ByteOrder::Big);
     }
 
     /// Regression check: `read_value` must never sign-extend — a high-bit-set
@@ -765,14 +860,24 @@ mod tests {
         let mut bus = make_bus();
         bus.write(0x0200, 0xFF).unwrap();
         assert_eq!(
-            read_value(|a| bus.peek(a).unwrap_or(0), 0x0200, VariableType::Byte),
+            read_value(
+                |a| bus.peek(a).unwrap_or(0),
+                0x0200,
+                VariableType::Byte,
+                ByteOrder::Little
+            ),
             0xFF
         );
 
         bus.write(0x0300, 0x00).unwrap();
         bus.write(0x0301, 0x80).unwrap();
         assert_eq!(
-            read_value(|a| bus.peek(a).unwrap_or(0), 0x0300, VariableType::Word),
+            read_value(
+                |a| bus.peek(a).unwrap_or(0),
+                0x0300,
+                VariableType::Word,
+                ByteOrder::Little
+            ),
             0x8000
         );
 
@@ -781,7 +886,12 @@ mod tests {
         bus.write(0x0402, 0x00).unwrap();
         bus.write(0x0403, 0x80).unwrap();
         assert_eq!(
-            read_value(|a| bus.peek(a).unwrap_or(0), 0x0400, VariableType::DWord),
+            read_value(
+                |a| bus.peek(a).unwrap_or(0),
+                0x0400,
+                VariableType::DWord,
+                ByteOrder::Little
+            ),
             0x80000000
         );
     }
@@ -790,7 +900,7 @@ mod tests {
     fn resolve_row_from_snapshot_reads_from_watched_bytes() {
         let bytes = HashMap::from([(0x0200u16, 0x34u8)]);
         let def = sample_def();
-        let row = resolve_row_from_snapshot(&def, Some(0x0200), &bytes);
+        let row = resolve_row_from_snapshot(&def, Some(0x0200), &bytes, ByteOrder::Little);
         assert_eq!(row.address, Some(0x0200));
         assert_eq!(row.value, Some(0x34));
         assert_eq!(row.source, None);
@@ -800,7 +910,7 @@ mod tests {
     fn resolve_row_from_snapshot_is_undefined_without_a_cached_address() {
         let bytes = HashMap::new();
         let def = sample_def();
-        let row = resolve_row_from_snapshot(&def, None, &bytes);
+        let row = resolve_row_from_snapshot(&def, None, &bytes, ByteOrder::Little);
         assert_eq!(row.address, None);
         assert_eq!(row.value, None);
     }
@@ -835,7 +945,7 @@ mod tests {
         let table = SymbolTable::default();
         let bus = make_bus();
         let def = sample_def();
-        let row = resolve_row(&def, &table, &bus);
+        let row = resolve_row(&def, &table, &bus, ByteOrder::Little);
         assert_eq!(row.address, None);
         assert_eq!(row.source, None);
         assert_eq!(row.value, None);
@@ -852,12 +962,12 @@ mod tests {
         let bus = make_bus();
         let def = sample_def();
 
-        let row = resolve_row(&def, &table, &bus);
+        let row = resolve_row(&def, &table, &bus, ByteOrder::Little);
         assert_eq!(row.address, Some(0x0200));
         assert_eq!(row.source.as_deref(), Some("User"));
 
         table.clear_source(&SymbolSource::User);
-        let row = resolve_row(&def, &table, &bus);
+        let row = resolve_row(&def, &table, &bus, ByteOrder::Little);
         assert_eq!(row.address, None);
         assert_eq!(row.source, None);
         assert_eq!(row.value, None);

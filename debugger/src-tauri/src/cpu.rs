@@ -53,11 +53,29 @@ pub struct StackDescription {
     pub page_fixed: bool,
 }
 
-/// The byte order of a word in memory. The 6809, still to come, adds `Big`.
+/// The byte order of a word in memory.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ByteOrder {
+    /// Least significant byte first: the 6502.
     Little,
+    /// Most significant byte first: the 6809.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the 6809's description, still to come, uses it")
+    )]
+    Big,
+}
+
+impl ByteOrder {
+    /// Assembles `bytes`, in address order, into an unsigned value.
+    pub fn assemble(self, bytes: impl DoubleEndedIterator<Item = u8>) -> u32 {
+        let push = |value: u32, byte: u8| (value << 8) | u32::from(byte);
+        match self {
+            ByteOrder::Little => bytes.rev().fold(0, push),
+            ByteOrder::Big => bytes.fold(0, push),
+        }
+    }
 }
 
 /// What the session's CPU looks like, sent to the frontend by `get_cpu_description` and
@@ -158,6 +176,20 @@ pub fn register_values(regs: &Registers) -> BTreeMap<&'static str, u32> {
     ])
 }
 
+/// Where the stack pointer points, as a bus address: the 6502's S is an offset into page 1.
+pub fn stack_pointer_address(regs: &Registers) -> u16 {
+    STACK_PAGE | u16::from(regs.s)
+}
+
+/// The address of the byte most recently pushed. The 6502 stores and then decrements S,
+/// so S points at the next free slot, one below that byte, wrapping within page 1.
+pub fn stack_top_address(regs: &Registers) -> u16 {
+    STACK_PAGE | u16::from(regs.s.wrapping_add(1))
+}
+
+/// The 6502's stack page.
+const STACK_PAGE: u16 = 0x0100;
+
 /// The flags register's value, for working out which flags a step changed.
 pub fn flags_value(regs: &Registers) -> u32 {
     u32::from(regs.p.to_byte())
@@ -245,6 +277,26 @@ mod tests {
             flags_value(&regs),
             u32::from(StatusRegister::UNUSED.to_byte())
         );
+    }
+
+    #[test]
+    fn byte_order_assembles_in_its_own_order() {
+        let bytes = [0x12, 0x34, 0x56, 0x78];
+        assert_eq!(ByteOrder::Little.assemble(bytes.into_iter()), 0x7856_3412);
+        assert_eq!(ByteOrder::Big.assemble(bytes.into_iter()), 0x1234_5678);
+        assert_eq!(ByteOrder::Little.assemble([0xab].into_iter()), 0xab);
+        assert_eq!(ByteOrder::Big.assemble([0xab].into_iter()), 0xab);
+    }
+
+    #[test]
+    fn the_6502_stack_top_is_one_above_s_within_page_1() {
+        let mut regs = zeroed();
+        regs.s = 0xfd;
+        assert_eq!(stack_pointer_address(&regs), 0x01fd);
+        assert_eq!(stack_top_address(&regs), 0x01fe);
+        regs.s = 0xff;
+        assert_eq!(stack_pointer_address(&regs), 0x01ff);
+        assert_eq!(stack_top_address(&regs), 0x0100);
     }
 
     #[test]
