@@ -22,7 +22,7 @@ impl<'a> Parser<'a> {
 
     /// Parses a single expression starting at the current token position, leaving
     /// any trailing tokens (a comma, a closing delimiter, a newline, ...) unconsumed
-    /// for the caller (the operand/statement grammar built in later units).
+    /// for the caller (the statement grammar and a target's operand grammar).
     pub fn parse_expr(&mut self) -> Result<Expr<'a>, Error> {
         self.parse_logical_or()
     }
@@ -226,7 +226,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Consumes and returns the current token, or `None` at end of input.
-    /// Public for the operand/statement grammar (later units), which parses
+    /// Public for the statement grammar and targets' operand grammars, which parse
     /// syntax `parse_expr` doesn't cover (e.g. `#`, `(`, `,`, index registers).
     pub fn advance(&mut self) -> Option<Token<'a>> {
         if self.is_at_end() {
